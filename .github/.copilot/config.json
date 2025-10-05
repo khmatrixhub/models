@@ -1,0 +1,15 @@
+{
+  "workspace": {
+    "fileGeneration": {
+      "defaultDirectory": "working_files",
+      "temporaryFiles": "working_files/temp",
+      "testFiles": "working_files/tests",
+      "analysisFiles": "working_files/analysis"
+    }
+  },
+  "notes": [
+    "Generated Python files will be saved to working_files/ folder",
+    "This folder is in .gitignore to keep repository clean",
+    "Use for temporary test scripts, analysis files, and exploration code"
+  ]
+}
