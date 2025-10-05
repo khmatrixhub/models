@@ -1,0 +1,44 @@
+spot: "USDJPY"
+start_date: "01022025"
+end_date: "09302025"
+
+# Moving Average parameters for signal generation
+ma_windows:
+  fast: 5   # Fast MA window (default: 5)
+  slow: 20  # Slow MA window (default: 20)
+
+# Label configurations: named strategies with [profit_target, stop_loss, max_hold_hours]
+labels:
+  conservative:
+    pt: 0.001  # 0.1% profit target
+    sl: 0.001  # 0.1% stop loss
+    max_hold: 24  # 24 hour max hold
+    use_ma_exit: false  # Standard PT/SL exit
+  
+  aggressive:
+    pt: 0.002  # 0.2% profit target
+    sl: 0.001  # 0.1% stop loss
+    max_hold: 48  # 48 hour max hold
+    use_ma_exit: false  # Standard PT/SL exit
+  
+  swing:
+    pt: 0.005  # 0.5% profit target
+    sl: 0.002  # 0.2% stop loss
+    max_hold: 120  # 120 hour max hold
+    use_ma_exit: false  # Standard PT/SL exit
+  
+  ma_crossover:
+    pt: 1.002  # 0.2% profit target (backup exit)
+    sl: 1.001  # 0.1% stop loss (backup exit)
+    max_hold: 72  # 72 hour max hold (backup exit)
+    use_ma_exit: true  # Exit on opposite MA signal (more realistic for MA strategy)
+
+# Training configuration
+training:
+  n_estimators: 100
+  use_rfe: false
+  max_features: 30
+  max_features_per_family: 3
+  bagging:
+    enabled: false
+    n_estimators: 50
