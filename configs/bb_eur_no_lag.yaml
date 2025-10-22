@@ -1,0 +1,33 @@
+# Bollinger Band Mean Reversion WITHOUT Lagged Profit Features
+# Use this to evaluate all test signals without time-of-day bias
+
+spot: "EURUSD"
+offsets: [0, 1, 2, 3]
+start_date: "01022025"
+end_date: "09302025"
+
+# Disable lagged profit features to eliminate NaN dropout
+use_lagged_profit_features: false
+
+# Signal strategy: BB mean reversion (enter on band touch)
+signal_strategy: "bb_mean_reversion"
+signal_params:
+  bb_window: 20
+  bb_std: 2.5
+  use_rsi_filter: false
+
+# Compare 2 BB exit strategies (same as bb_eur.yaml subset)
+labels:
+  # Strategy 1: Exit at middle band (MA line) - Quickest exits, highest win rate
+  bb_middle:
+    use_bb_exit: true
+    bb_exit_strategy: "middle"
+    bb_window: 20          # Must match signal params
+    bb_std: 2.5
+  
+  # Strategy 2: Exit at opposite band - Maximum profit potential
+  bb_opposite:
+    use_bb_exit: true
+    bb_exit_strategy: "opposite_band"
+    bb_window: 20
+    bb_std: 2.5

@@ -1,0 +1,56 @@
+spot: "USDJPY"
+start_date: "01022025"
+end_date: "09302025"
+
+# Signal strategy selection
+signal_strategy: "bb_mean_reversion"  # Options: "ma_cross" (default), "bb_mean_reversion"
+
+# Bollinger Band parameters for signal generation
+bollinger_bands:
+  window: 20    # Period for BB middle line (SMA)
+  std: 2.0      # Number of standard deviations for upper/lower bands
+  rsi_threshold: null  # Optional RSI confirmation: [oversold, overbought] e.g., [30, 70]
+                       # Set to null to use BB only without RSI filter
+
+# Moving Average parameters (still used for features, not signals)
+ma_windows:
+  fast: 5   # Fast MA window for features
+  slow: 20  # Slow MA window for features
+
+# Label configurations: named strategies with [profit_target, stop_loss, max_hold_hours]
+labels:
+  conservative:
+    pt: 0.001  # 0.1% profit target (10 pips for USDJPY at 150)
+    sl: 0.001  # 0.1% stop loss
+    max_hold: 24  # 24 hour max hold
+    use_ma_exit: false  # Standard PT/SL exit
+  
+  aggressive:
+    pt: 0.002  # 0.2% profit target (20 pips)
+    sl: 0.001  # 0.1% stop loss
+    max_hold: 48  # 48 hour max hold
+    use_ma_exit: false  # Standard PT/SL exit
+  
+  swing:
+    pt: 0.005  # 0.5% profit target (50 pips)
+    sl: 0.002  # 0.2% stop loss
+    max_hold: 120  # 120 hour max hold
+    use_ma_exit: false  # Standard PT/SL exit
+  
+  mean_reversion_quick:
+    pt: 0.0015  # 0.15% profit target (quick mean reversion)
+    sl: 0.001   # 0.1% stop loss
+    max_hold: 12  # 12 hour max hold (expect quick reversal)
+    use_ma_exit: false  # Standard PT/SL exit
+
+# Training configuration
+training:
+  n_estimators: 100
+  use_rfe: false
+  max_features: 30
+  max_features_per_family: 3
+  reverse_signals: false  # Set to true to flip all signals (long->short, short->long)
+  min_profit_threshold: 0.0  # Minimum profit to consider a "win"
+  bagging:
+    enabled: true
+    n_estimators: 200

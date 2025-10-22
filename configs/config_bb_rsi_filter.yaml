@@ -1,0 +1,51 @@
+spot: "EURUSD"
+start_date: "01022025"
+end_date: "09302025"
+
+# Signal strategy selection
+signal_strategy: "bb_mean_reversion"  # Bollinger Band mean reversion with RSI filter
+
+# Bollinger Band parameters for signal generation
+bollinger_bands:
+  window: 20    # Period for BB middle line (SMA)
+  std: 2.0      # Number of standard deviations for upper/lower bands
+  rsi_threshold: [30, 70]  # RSI confirmation: buy when RSI<30 AND price<lower_band
+                           #                    sell when RSI>70 AND price>upper_band
+                           # This makes signals more conservative (fewer false signals)
+
+# Moving Average parameters (still used for features, not signals)
+ma_windows:
+  fast: 5   # Fast MA window for features
+  slow: 20  # Slow MA window for features
+
+# Label configurations: named strategies with [profit_target, stop_loss, max_hold_hours]
+labels:
+  conservative:
+    pt: 0.001  # 0.1% profit target
+    sl: 0.001  # 0.1% stop loss
+    max_hold: 24  # 24 hour max hold
+    use_ma_exit: false
+  
+  aggressive:
+    pt: 0.002  # 0.2% profit target
+    sl: 0.001  # 0.1% stop loss
+    max_hold: 48  # 48 hour max hold
+    use_ma_exit: false
+  
+  swing:
+    pt: 0.005  # 0.5% profit target
+    sl: 0.002  # 0.2% stop loss
+    max_hold: 120  # 120 hour max hold
+    use_ma_exit: false
+
+# Training configuration
+training:
+  n_estimators: 100
+  use_rfe: false
+  max_features: 30
+  max_features_per_family: 3
+  reverse_signals: false
+  min_profit_threshold: 0.0
+  bagging:
+    enabled: true
+    n_estimators: 200

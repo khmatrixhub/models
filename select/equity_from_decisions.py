@@ -1,96 +1,125 @@
-"""
-Reusable equity plotting & stats from decisions.csv files.
-
-Required columns in the CSV:
-- date
-- choose_strategy1   (0/1)
-- pnl_1_next
-- pnl_2_next
-
-Public functions:
-- plot_from_decisions(decisions_csv, out_png=None, title=None)
-- stats_from_decisions(decisions_csv) -> dict
-- plot_multi(files, labels=None, out_png=None, title=None)
-
-All plots use matplotlib (no seaborn). Equities are rebuilt
-from the PnL columns so they’re consistent across scripts.
-"""
-from __future__ import annotations
+# equity_from_decisions.py
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import List, Optional, Dict
+from typing import Dict, Optional, List, Tuple
+
+REQUIRED = ("date", "choose_strategy1", "pnl_1_next", "pnl_2_next",
+            "count_1_next", "count_2_next")  # <-- counts required
 
 def _load_decisions(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     df.columns = [c.lower() for c in df.columns]
-    if "date" not in df.columns:
-        raise ValueError("decisions csv must have a 'date' column")
-    for col in ("pnl_1_next", "pnl_2_next", "choose_strategy1"):
-        if col not in df.columns:
-            raise ValueError(f"decisions csv missing required column: '{col}'")
+    missing = [c for c in REQUIRED if c not in df.columns]
+    if missing:
+        raise ValueError(f"decisions csv missing columns: {missing}")
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     return df
 
-def _equities_from_df(df: pd.DataFrame):
-    p1 = pd.to_numeric(df["pnl_1_next"], errors="coerce").fillna(0.0).values
-    p2 = pd.to_numeric(df["pnl_2_next"], errors="coerce").fillna(0.0).values
-    c  = pd.to_numeric(df["choose_strategy1"], errors="coerce").fillna(0.0).astype(int).values
-    e1 = np.cumsum(p1)
-    e2 = np.cumsum(p2)
-    ea = np.cumsum(c*p1 + (1-c)*p2)
-    return df["date"].values, e1, e2, ea, p1, p2, (c*p1 + (1-c)*p2)
+def _extract_arrays(df: pd.DataFrame):
+    p1 = pd.to_numeric(df["pnl_1_next"], errors="coerce").fillna(0.0).to_numpy()
+    p2 = pd.to_numeric(df["pnl_2_next"], errors="coerce").fillna(0.0).to_numpy()
+    c  = pd.to_numeric(df["choose_strategy1"], errors="coerce").fillna(0.0).astype(int).to_numpy()
+    n1 = pd.to_numeric(df["count_1_next"], errors="coerce").fillna(0.0).to_numpy()
+    n2 = pd.to_numeric(df["count_2_next"], errors="coerce").fillna(0.0).to_numpy()
+    pa = c * p1 + (1 - c) * p2
+    na = c * n1 + (1 - c) * n2
+    return p1, p2, pa, c, n1, n2, na
 
-def _stats_from_pnl(pnl: np.ndarray) -> Dict[str, float]:
+def _max_drawdown_from_pnl(pnl: np.ndarray) -> float:
     eq = np.cumsum(pnl)
-    peaks = np.maximum.accumulate(eq) if len(eq) else np.array([])
-    mdd = float((peaks - eq).max()) if len(eq) else 0.0
-    sr = float(pnl.mean()/pnl.std(ddof=1)*np.sqrt(252)) if len(pnl)>1 and pnl.std(ddof=1)>0 else 0.0
-    return {
-        "total_pnl": float(pnl.sum() if len(pnl) else 0.0),
-        "avg_pnl": float(pnl.mean() if len(pnl) else 0.0),
-        "max_drawdown": mdd,
-        "sharpe": sr,
-        "n_days": int(len(pnl)),
-    }
+    if len(eq) == 0:
+        return 0.0
+    peaks = np.maximum.accumulate(eq)
+    return float((peaks - eq).max())
 
-def stats_from_decisions(decisions_csv: str) -> Dict[str, Dict[str, float]]:
-    df = _load_decisions(decisions_csv)
-    _, _, _, _, p1, p2, pa = _equities_from_df(df)
-    return {
-        "Always_1": _stats_from_pnl(p1),
-        "Always_2": _stats_from_pnl(p2),
-        "Adaptive": _stats_from_pnl(pa),
-    }
+def _sharpe(pnl: np.ndarray, periods_per_year: int = 252) -> float:
+    if len(pnl) < 2:
+        return 0.0
+    sd = pnl.std(ddof=1)
+    return float(pnl.mean() / sd * np.sqrt(periods_per_year)) if sd > 0 else 0.0
 
-def plot_from_decisions(decisions_csv: str, out_png: Optional[str]=None, title: Optional[str]=None):
+def _per_trade_stats(total_pnl: float, total_trades: float, fee_per_trade: float):
+    gross_avg = float(total_pnl / total_trades) if total_trades > 0 else 0.0
+    net_total = float(total_pnl - fee_per_trade * total_trades)
+    net_avg   = float(net_total / total_trades) if total_trades > 0 else 0.0
+    return gross_avg, net_total, net_avg
+
+def stats_from_decisions(
+    decisions_csv: str,
+    fee_per_trade: float = 0.0,   # round-turn fee per filled trade
+    include_daily_metrics: bool = True
+) -> pd.DataFrame:
+    """
+    Returns a DataFrame with:
+      total_trades, gross_total_pnl, gross_avg_pnl_per_trade,
+      net_total_pnl, net_avg_pnl_per_trade,
+      (optional) daily_sharpe, daily_max_drawdown  -- computed on daily PnL streams
+    """
     df = _load_decisions(decisions_csv)
-    dates, e1, e2, ea, *_ = _equities_from_df(df)
-    plt.figure(figsize=(12,6))
-    plt.plot(dates, e1, label="Always 1")
-    plt.plot(dates, e2, label="Always 2")
-    plt.plot(dates, ea, label="Adaptive", linewidth=2)
+    p1, p2, pa, c, n1, n2, na = _extract_arrays(df)
+
+    def _row(pnl, ntr):
+        total_trades = float(ntr.sum())
+        gross_total = float(pnl.sum())
+        gross_avg, net_total, net_avg = _per_trade_stats(gross_total, total_trades, fee_per_trade)
+        out = {
+            "total_trades": total_trades,
+            "gross_total_pnl": gross_total,
+            "gross_avg_pnl_per_trade": gross_avg,
+            "net_total_pnl": net_total,
+            "net_avg_pnl_per_trade": net_avg,
+        }
+        if include_daily_metrics:
+            out.update({
+                "daily_sharpe": _sharpe(pnl),
+                "daily_max_drawdown": _max_drawdown_from_pnl(pnl),
+            })
+        return out
+
+    rows = {
+        "Always_1": _row(p1, n1),
+        "Always_2": _row(p2, n2),
+        "Adaptive": _row(pa, na),
+    }
+    return pd.DataFrame.from_dict(rows, orient="index")
+
+def write_stats(
+    decisions_csv: str,
+    out_csv: str,
+    fee_per_trade: float = 0.0,
+    include_daily_metrics: bool = True
+) -> None:
+    stats_from_decisions(decisions_csv, fee_per_trade, include_daily_metrics).to_csv(out_csv)
+
+def plot_from_decisions(decisions_csv: str, out_png: Optional[str] = None, title: Optional[str] = None) -> None:
+    df = _load_decisions(decisions_csv)
+    p1, p2, pa, *_ = _extract_arrays(df)
+    dates = df["date"].to_numpy()
+    eq1, eq2, eqA = np.cumsum(p1), np.cumsum(p2), np.cumsum(pa)
+    plt.figure(figsize=(12, 6))
+    plt.plot(dates, eq1, label="Always 1")
+    plt.plot(dates, eq2, label="Always 2")
+    plt.plot(dates, eqA, label="Adaptive", linewidth=2)
     plt.grid(True); plt.legend(); plt.title(title or "Equity from decisions.csv"); plt.tight_layout()
     if out_png:
         plt.savefig(out_png, dpi=150); plt.close()
     else:
         plt.show()
 
-def plot_multi(files: List[str], labels: Optional[List[str]]=None, out_png: Optional[str]=None, title: Optional[str]=None):
-    if labels is None: labels = [f"run{i+1}" for i in range(len(files))]
+def plot_multi(files: List[str], labels: Optional[List[str]] = None, out_png: Optional[str] = None, title: Optional[str] = None) -> None:
+    if labels is None:
+        labels = [f"run{i+1}" for i in range(len(files))]
     assert len(labels) == len(files), "labels and files must be same length"
-    plt.figure(figsize=(12,6))
+    plt.figure(figsize=(12, 6))
     for f, lab in zip(files, labels):
         df = _load_decisions(f)
-        dates, *_ , ea_p1, ea_p2, ea = df["date"].values, None, None, None, None, None, None
-        # Recompute only adaptive equity for overlay
-        _, _, _, ea_curve, *_ = _equities_from_df(df)
-        plt.plot(df["date"].values, ea_curve, label=lab)
+        _, _, pa, *_ = _extract_arrays(df)
+        plt.plot(df["date"].to_numpy(), np.cumsum(pa), label=lab)
     plt.grid(True); plt.legend(); plt.title(title or "Adaptive equity comparison"); plt.tight_layout()
     if out_png:
         plt.savefig(out_png, dpi=150); plt.close()
     else:
         plt.show()
-
 

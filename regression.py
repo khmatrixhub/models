@@ -1,12 +1,12 @@
-# Walk-forward training and evaluation for forex data
+# Walk-forward regression training for forex profit prediction
 import click
 from datetime import datetime, timedelta
 import pandas as pd
 import shutil
 import numpy as np
 from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.ensemble import RandomForestClassifier, BaggingClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.ensemble import RandomForestRegressor, BaggingRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.feature_selection import RFE
 import os
 import logging
@@ -71,7 +71,7 @@ def top_features_per_family(features, importances, max_per_family=2):
 
 
 def train_model(X_train, y_train, config, n_jobs=-1):
-    """Train a Random Forest model with feature selection"""
+    """Train a Random Forest Regressor model with feature selection"""
     logging.info(f"DEBUG: Initial data shapes - X_train: {X_train.shape}, y_train: {len(y_train)}")
     
     # Check for duplicate indices first
@@ -107,10 +107,11 @@ def train_model(X_train, y_train, config, n_jobs=-1):
     use_bagging = config.get("bagging", {}).get("enabled", False)
     bagging_estimators = config.get("bagging", {}).get("n_estimators", 100)
     n_estimators = config.get("n_estimators", 100)
+    model_type = config.get("model_type", "random_forest")  # random_forest or gradient_boosting
     
-    logging.info(f"Training RF model with {n_estimators} estimators, bagging={use_bagging}, use_rfe={use_rfe}")
+    logging.info(f"Training regression model with {n_estimators} estimators, model_type={model_type}, bagging={use_bagging}, use_rfe={use_rfe}")
 
-    # Additional validation for invalid values
+    # Additional validation for invalid values in features
     if X_train.isna().any().any():
         logging.warning("Found NaN values in training data after initial cleaning")
         nan_columns = X_train.columns[X_train.isna().any()].tolist()
@@ -126,18 +127,46 @@ def train_model(X_train, y_train, config, n_jobs=-1):
         X_train = X_train.replace([np.inf, -np.inf], np.nan).dropna()
         y_train = y_train.loc[X_train.index]
         logging.info(f"DEBUG: After inf cleaning - X_train: {X_train.shape}, y_train: {len(y_train)}")
+    
+    # CRITICAL: Clean target variable (y_train) for NaN and inf values
+    if y_train.isna().any():
+        logging.warning(f"Found {y_train.isna().sum()} NaN values in target variable (y_train)")
+        valid_mask = ~y_train.isna()
+        y_train = y_train[valid_mask]
+        X_train = X_train.loc[y_train.index]
+        logging.info(f"DEBUG: After y_train NaN removal - X_train: {X_train.shape}, y_train: {len(y_train)}")
+    
+    if np.isinf(y_train).any():
+        logging.warning(f"Found {np.isinf(y_train).sum()} infinite values in target variable (y_train)")
+        valid_mask = ~np.isinf(y_train)
+        y_train = y_train[valid_mask]
+        X_train = X_train.loc[y_train.index]
+        logging.info(f"DEBUG: After y_train inf removal - X_train: {X_train.shape}, y_train: {len(y_train)}")
+    
+    # Final validation
+    if len(X_train) == 0 or len(y_train) == 0:
+        raise ValueError(f"No valid training data after cleaning! X_train: {len(X_train)}, y_train: {len(y_train)}")
+    
+    if len(X_train) != len(y_train):
+        raise ValueError(f"Shape mismatch after cleaning: X_train: {len(X_train)}, y_train: {len(y_train)}")
 
-    # Initialize classifier
-    if use_bagging:
-        base_classifier = RandomForestClassifier(
-            n_estimators=1, 
-            class_weight='balanced_subsample',
-            bootstrap=False,
-            criterion='entropy', 
+    # Initialize regressor based on model type
+    if model_type == "gradient_boosting":
+        base_regressor = GradientBoostingRegressor(
+            n_estimators=n_estimators,
+            learning_rate=0.1,
+            max_depth=5,
             random_state=42
         )
-        rf_classifier = BaggingClassifier(
-            estimator=base_classifier,
+        rf_regressor = base_regressor
+    elif use_bagging:
+        base_regressor = RandomForestRegressor(
+            n_estimators=1, 
+            criterion='squared_error',
+            random_state=42
+        )
+        rf_regressor = BaggingRegressor(
+            estimator=base_regressor,
             n_estimators=bagging_estimators,
             max_features=1.0,
             bootstrap=False,
@@ -145,34 +174,85 @@ def train_model(X_train, y_train, config, n_jobs=-1):
             random_state=42
         )
     else:
-        rf_classifier = RandomForestClassifier(
+        rf_regressor = RandomForestRegressor(
             n_estimators=n_estimators,
-            class_weight='balanced_subsample',
-            criterion='entropy', 
+            criterion='squared_error',
             random_state=42,
             n_jobs=n_jobs
         )
 
+    # FINAL validation before feature selection - ensure absolutely no NaN/inf
+    logging.info(f"DEBUG: Pre-feature-selection validation - X_train: {X_train.shape}, y_train: {len(y_train)}")
+    
+    # Check X_train one more time
+    if X_train.isna().any().any():
+        nan_count = X_train.isna().sum().sum()
+        logging.error(f"CRITICAL: Found {nan_count} NaN in X_train before feature selection")
+        X_train = X_train.dropna()
+        y_train = y_train.loc[X_train.index]
+        logging.info(f"DEBUG: After final X_train cleaning: {X_train.shape}, y_train: {len(y_train)}")
+    
+    if np.isinf(X_train.values).any():
+        inf_count = np.isinf(X_train.values).sum()
+        logging.error(f"CRITICAL: Found {inf_count} inf in X_train before feature selection")
+        X_train = X_train.replace([np.inf, -np.inf], np.nan).dropna()
+        y_train = y_train.loc[X_train.index]
+        logging.info(f"DEBUG: After final X_train inf cleaning: {X_train.shape}, y_train: {len(y_train)}")
+    
+    # Check y_train one more time
+    if y_train.isna().any():
+        nan_count = y_train.isna().sum()
+        logging.error(f"CRITICAL: Found {nan_count} NaN in y_train before feature selection")
+        valid_mask = ~y_train.isna()
+        y_train = y_train[valid_mask]
+        X_train = X_train.loc[y_train.index]
+        logging.info(f"DEBUG: After final y_train NaN cleaning: {X_train.shape}, y_train: {len(y_train)}")
+    
+    if np.isinf(y_train.values).any():
+        inf_count = np.isinf(y_train.values).sum()
+        logging.error(f"CRITICAL: Found {inf_count} inf in y_train before feature selection")
+        valid_mask = ~np.isinf(y_train.values)
+        y_train = y_train[valid_mask]
+        X_train = X_train.loc[y_train.index]
+        logging.info(f"DEBUG: After final y_train inf cleaning: {X_train.shape}, y_train: {len(y_train)}")
+    
+    # Verify we still have data
+    if len(X_train) == 0 or len(y_train) == 0:
+        raise ValueError(f"No data left after final cleaning! X_train: {len(X_train)}, y_train: {len(y_train)}")
+    
+    logging.info(f"DEBUG: Data validated for feature selection - X_train: {X_train.shape}, y_train: {len(y_train)}")
+    logging.info(f"DEBUG: X_train has NaN: {X_train.isna().any().any()}, has inf: {np.isinf(X_train.values).any()}")
+    logging.info(f"DEBUG: y_train has NaN: {y_train.isna().any()}, has inf: {np.isinf(y_train.values).any()}")
+    
     # Feature selection
     if use_rfe:
         rfe_estimators = config.get("rfe", {}).get("n_estimators", 50)
         rfe_features = config.get("rfe", {}).get("n_features", 20)
         logging.info(f"RFE settings: estimators={rfe_estimators}, features={rfe_features}")
         
-        rfe_classifier = RandomForestClassifier(
+        rfe_regressor = RandomForestRegressor(
             n_estimators=rfe_estimators,
-            class_weight='balanced_subsample',
-            criterion='entropy',
+            criterion='squared_error',
             random_state=42,
             n_jobs=n_jobs
         )
-        rfe = RFE(estimator=rfe_classifier, n_features_to_select=rfe_features)
-        rfe.fit(X_train, y_train.values.ravel())
+        rfe = RFE(estimator=rfe_regressor, n_features_to_select=rfe_features)
+        
+        # Ensure y_train is 1D array without NaN
+        y_train_array = y_train.values.ravel()
+        logging.info(f"DEBUG: y_train_array for RFE - shape: {y_train_array.shape}, has NaN: {np.isnan(y_train_array).any()}")
+        
+        rfe.fit(X_train, y_train_array)
         selected_features = X_train.columns[rfe.support_]
     else:
         # Use importance-based feature selection with family grouping
-        rf_temp = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=n_jobs)
-        rf_temp.fit(X_train, y_train)
+        rf_temp = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=n_jobs)
+        
+        # Ensure y_train is clean for fitting
+        y_train_array = y_train.values.ravel()
+        logging.info(f"DEBUG: y_train_array for feature selection - shape: {y_train_array.shape}, has NaN: {np.isnan(y_train_array).any()}")
+        
+        rf_temp.fit(X_train, y_train_array)
         
         importances = rf_temp.feature_importances_
         top_features, top_imps = top_features_per_family(
@@ -192,11 +272,15 @@ def train_model(X_train, y_train, config, n_jobs=-1):
     X_train_selected = X_train[selected_features]
     
     logging.info(f"Training data shape: {X_train_selected.shape}")
-    logging.info(f"Target distribution: {y_train.value_counts().to_dict()}")
+    logging.info(f"Target statistics: Mean={y_train.mean():.6f}, Median={y_train.median():.6f}, Std={y_train.std():.6f}")
     
-    rf_classifier.fit(X_train_selected, y_train.values.ravel())
+    # Final check before training
+    y_train_final = y_train.values.ravel()
+    logging.info(f"DEBUG: Final training - y_train shape: {y_train_final.shape}, has NaN: {np.isnan(y_train_final).any()}")
     
-    return rf_classifier, selected_features
+    rf_regressor.fit(X_train_selected, y_train_final)
+    
+    return rf_regressor, selected_features
 
 
 def predict_model(model, X_test, selected_features):
@@ -252,70 +336,9 @@ def predict_model(model, X_test, selected_features):
         return pd.Series([], dtype=float)
     
     try:
-        y_pred_proba = model.predict_proba(X_test_selected)[:, 1]
-        logging.info(f"DEBUG PREDICT: Successfully predicted {len(y_pred_proba)} samples")
-        return pd.Series(y_pred_proba, index=X_test_selected.index)
-    except Exception as e:
-        logging.error(f"DEBUG PREDICT: Prediction failed: {str(e)}")
-        raise
-
-
-def predict_model(model, X_test, selected_features):
-    """Make predictions using trained model"""
-    logging.info(f"DEBUG PREDICT: Input X_test shape: {X_test.shape}")
-    logging.info(f"DEBUG PREDICT: Selected features count: {len(selected_features)}")
-    
-    if len(X_test) == 0:
-        logging.warning("DEBUG PREDICT: Empty X_test, returning empty series")
-        return pd.Series([], dtype=float)
-    
-    # Check for duplicates in test data
-    if X_test.index.duplicated().any():
-        logging.warning(f"DEBUG PREDICT: Found {X_test.index.duplicated().sum()} duplicate indices in X_test")
-        X_test = X_test[~X_test.index.duplicated(keep='first')]
-        logging.info(f"DEBUG PREDICT: After deduplication: {X_test.shape}")
-    
-    X_test = X_test.dropna()
-    logging.info(f"DEBUG PREDICT: After dropna: {X_test.shape}")
-    
-    if len(X_test) == 0:
-        logging.warning("DEBUG PREDICT: Empty X_test after cleaning, returning empty series")
-        return pd.Series([], dtype=float)
-    
-    # Check if all selected features exist in X_test
-    missing_features = [f for f in selected_features if f not in X_test.columns]
-    if missing_features:
-        logging.error(f"DEBUG PREDICT: Missing features in X_test: {missing_features}")
-        logging.error(f"DEBUG PREDICT: Available features: {list(X_test.columns)}")
-        raise ValueError(f"Missing features: {missing_features}")
-    
-    X_test_selected = X_test[selected_features]
-    logging.info(f"DEBUG PREDICT: X_test_selected shape: {X_test_selected.shape}")
-    logging.info(f"DEBUG PREDICT: Expected features: {len(selected_features)}")
-    
-    # Check for any remaining NaN or inf values
-    if X_test_selected.isna().any().any():
-        logging.warning("DEBUG PREDICT: Found NaN in selected features")
-        nan_cols = X_test_selected.columns[X_test_selected.isna().any()].tolist()
-        logging.warning(f"DEBUG PREDICT: NaN columns: {nan_cols}")
-        X_test_selected = X_test_selected.dropna()
-        logging.info(f"DEBUG PREDICT: After NaN removal: {X_test_selected.shape}")
-    
-    if np.isinf(X_test_selected).any().any():
-        logging.warning("DEBUG PREDICT: Found inf in selected features")
-        inf_cols = X_test_selected.columns[np.isinf(X_test_selected).any()].tolist()
-        logging.warning(f"DEBUG PREDICT: Inf columns: {inf_cols}")
-        X_test_selected = X_test_selected.replace([np.inf, -np.inf], np.nan).dropna()
-        logging.info(f"DEBUG PREDICT: After inf removal: {X_test_selected.shape}")
-    
-    if len(X_test_selected) == 0:
-        logging.warning("DEBUG PREDICT: Empty X_test_selected after cleaning, returning empty series")
-        return pd.Series([], dtype=float)
-    
-    try:
-        y_pred_proba = model.predict_proba(X_test_selected)[:, 1]
-        logging.info(f"DEBUG PREDICT: Successfully predicted {len(y_pred_proba)} samples")
-        return pd.Series(y_pred_proba, index=X_test_selected.index)
+        y_pred = model.predict(X_test_selected)
+        logging.info(f"DEBUG PREDICT: Successfully predicted {len(y_pred)} samples")
+        return pd.Series(y_pred, index=X_test_selected.index)
     except Exception as e:
         logging.error(f"DEBUG PREDICT: Prediction failed: {str(e)}")
         raise
@@ -332,7 +355,7 @@ def predict_model(model, X_test, selected_features):
 @click.option('--label-name', default=None, type=str, help='Name of label configuration to use (e.g., "conservative", "aggressive", "swing")')
 def main(config, start_train_date, end_date, retrain_frequency, min_train_days, n_jobs, experiment, label_name):
     """
-    Walk-forward training and evaluation for forex trading models
+    Walk-forward regression training for forex profit prediction
     """
     # Load configuration
     import yaml
@@ -346,11 +369,11 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
     # Base directory for this config under results/
     base_results_dir = Path("results") / config_name
     
-    # Data directories (where mainoffset.py saves outputs)
+    # Data directories (where generate.py saves outputs)
     signals_dir = base_results_dir / "signals"
     data_dir = base_results_dir / "data"  # Features and labels are here now
     
-    # Training experiment directories (where train_forex.py saves outputs)
+    # Training experiment directories (where regression.py saves outputs)
     models_dir = base_results_dir / "models" / experiment
     predictions_dir = base_results_dir / "predictions" / experiment
     experiment_results_dir = base_results_dir / "models" / experiment / "results"
@@ -364,8 +387,8 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
     results_dir = experiment_results_dir
     
     # Setup logging
-    log_file = setup_logging(base_results_dir / "logs", f"train_forex_{experiment}")
-    logging.info(f"Starting walk-forward training experiment: {experiment}")
+    log_file = setup_logging(base_results_dir / "logs", f"regression_{experiment}")
+    logging.info(f"Starting walk-forward regression training experiment: {experiment}")
     logging.info(f"Config: {config_name}")
     logging.info(f"Data directory: {data_dir}")
     logging.info(f"Models directory: {models_dir}")
@@ -377,6 +400,7 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
     # Save experiment metadata
     experiment_metadata = {
         'experiment_name': experiment,
+        'model_type': 'regression',
         'start_date': start_train_date.strftime("%Y%m%d") if start_train_date else settings['start_date'],
         'end_date': end_date.strftime("%Y%m%d") if end_date else settings['end_date'],
         'retrain_frequency': retrain_frequency,
@@ -401,9 +425,9 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
         raise ValueError(f"Label '{label_name}' not found in config. Available labels: {available_labels}")
     
     selected_label = settings['labels'][label_name]
-    pt = selected_label.get('pt', None)
-    sl = selected_label.get('sl', None)
-    max_hold = selected_label.get('max_hold', None)
+    pt = selected_label['pt']
+    sl = selected_label['sl']
+    max_hold = selected_label['max_hold']
     
     # Add label config to metadata
     experiment_metadata['label_config'] = {
@@ -414,7 +438,7 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
         'all_configs': settings['labels']
     }
     
-    # Add training config to metadata (including signal reversal status)
+    # Add training config to metadata
     experiment_metadata['training_config'] = settings.get('training', {})
     
     with open(results_dir / "experiment_metadata.json", 'w') as f:
@@ -443,16 +467,13 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
     model = None
     selected_features = None
     all_features = pd.DataFrame()
-    all_labels = pd.Series(dtype=int)
-    all_predictions = pd.Series(dtype=float)
-    all_test_labels = pd.Series(dtype=int)
-    all_profits = pd.Series(dtype=float)
+    all_profits = pd.Series(dtype=float)  # Training target (actual profits)
+    all_predictions = pd.Series(dtype=float)  # Predicted profits
+    all_test_profits = pd.Series(dtype=float)  # True profits for test data
     
     # Track processing statistics
     dates_processed = []
     dates_skipped = []
-    dates_with_predictions = []
-    dates_with_training = []
     
     # Load training configuration from YAML, with defaults as fallback
     training_config = settings.get('training', {})
@@ -464,25 +485,16 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
     training_config.setdefault('max_features_per_family', 3)
     training_config.setdefault('bagging', {'enabled': False, 'n_estimators': 100})
     training_config.setdefault('reverse_signals', False)
-    training_config.setdefault('min_profit_threshold', 0.0)
+    training_config.setdefault('model_type', 'random_forest')  # random_forest or gradient_boosting
     
     # Extract reverse_signals flag for easy access
     reverse_signals = training_config.get('reverse_signals', False)
-    min_profit_threshold = training_config.get('min_profit_threshold', 0.0)
     
     if reverse_signals:
         logging.info("=" * 60)
         logging.info("SIGNAL REVERSAL ENABLED")
         logging.info("All signals will be reversed: Long->Short, Short->Long")
         logging.info("Profits will be flipped accordingly")
-        logging.info("=" * 60)
-    
-    if min_profit_threshold > 0:
-        logging.info("=" * 60)
-        logging.info("MINIMUM PROFIT THRESHOLD ENABLED")
-        logging.info(f"Only trades with profit > {min_profit_threshold:.4f} ({min_profit_threshold*100:.2f}%) will be labeled as 'wins'")
-        logging.info("This trains the model to identify BIGGER winners")
-        logging.info("Trades with smaller profits will be treated as losses")
         logging.info("=" * 60)
     
     logging.info(f"Training configuration: {training_config}")
@@ -496,11 +508,8 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
             # Load data for current date with currency pair in filename
             features_file = data_dir / f"{date_str}_{spot}_features.parquet"
             
-            # Construct label filename - use label_name if PT/SL/max_hold are all None
-            if pt is None and sl is None and max_hold is None:
-                labels_file = data_dir / f"{date_str}_{spot}_{label_name}_y.parquet"
-            else:
-                labels_file = data_dir / f"{date_str}_{spot}_{pt}_{sl}_{max_hold}_y.parquet"
+            # Construct label filename using selected label configuration
+            labels_file = data_dir / f"{date_str}_{spot}_{pt}_{sl}_{max_hold}_y.parquet"
             
             logging.info(f"Looking for label file: {labels_file.name}")
             
@@ -541,7 +550,6 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
                     logging.info(f"DEBUG: Reversed signals in first column")
                 
                 # IMPORTANT: Also reverse the profits since we're trading the opposite direction
-                # A long signal that made +2% becomes a short signal that would make -2%
                 if 'profit' in labels_df.columns:
                     original_profit_mean = labels_df['profit'].mean()
                     labels_df['profit'] = -labels_df['profit']
@@ -553,7 +561,6 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
                     logging.info(f"DEBUG: Reversed labels (1<->-1)")
             
             # Filter to only signal bars (where signal != 0)
-            # This ensures we only train on MA crossover bars
             if 'signal' in signals.columns:
                 signal_series = signals['signal']
             else:
@@ -570,7 +577,6 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
             labels_df = labels_df[signal_mask]
             
             # If signals are reversed, also reverse signal-adjusted features
-            # These features were multiplied by signal direction, so need to be flipped
             if reverse_signals:
                 adj_features = ['returns_adj', 'log_returns_adj', 'ma5_distance_adj', 'ma20_distance_adj']
                 for adj_feat in adj_features:
@@ -579,31 +585,13 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
                         logging.info(f"DEBUG: Reversed feature {adj_feat}")
             
             logging.info(f"DEBUG: After signal filtering - signals: {signals.shape}, features: {features.shape}, labels_df: {labels_df.shape}")
-            logging.info(f"DEBUG: Features index type: {type(features.index)}, Labels index type: {type(labels_df.index)}")
-            
-            # DEBUG: Check for duplicates in raw data
-            features_dups = features.index.duplicated().sum()
-            labels_dups = labels_df.index.duplicated().sum()
-            logging.info(f"DEBUG: Raw duplicates - features: {features_dups}, labels: {labels_dups}")
-            
-            if features_dups > 0:
-                logging.warning(f"DEBUG: Found {features_dups} duplicate indices in raw features")
-                # Show some examples of duplicate timestamps
-                dup_indices = features.index[features.index.duplicated(keep=False)]
-                unique_dups = dup_indices.unique()[:5]  # Show first 5 duplicate timestamps
-                logging.warning(f"DEBUG: Example duplicate timestamps: {unique_dups.tolist()}")
-                
-                # Show how many times each duplicate appears
-                for dup_time in unique_dups:
-                    count = (features.index == dup_time).sum()
-                    logging.warning(f"DEBUG: Timestamp {dup_time} appears {count} times")
             
             # Clean and align data
             initial_features_len = len(features)
             features = features.dropna()
             logging.info(f"DEBUG: Features after dropna: {features.shape} (removed {initial_features_len - len(features)})")
             
-            # Align labels with features BEFORE creating binary labels
+            # Align labels with features
             labels_df = labels_df.loc[features.index]
             logging.info(f"DEBUG: Labels after alignment: {labels_df.shape}")
             
@@ -612,57 +600,23 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
                 dates_skipped.append(date_str)
                 continue
             
-            # Extract binary labels and profits from label DataFrame
-            # Labels file now contains: 'label' (1/-1), 'profit' (actual %), 'exit_bars'
+            # Extract profit values (regression target)
             if 'profit' not in labels_df.columns:
                 logging.error(f"Label file missing 'profit' column for {date_str}")
                 logging.error(f"Available columns: {list(labels_df.columns)}")
                 dates_skipped.append(date_str)
                 continue
             
-            if 'label' not in labels_df.columns:
-                logging.error(f"Label file missing 'label' column for {date_str}")
-                logging.error(f"Available columns: {list(labels_df.columns)}")
-                dates_skipped.append(date_str)
-                continue
+            profits = labels_df['profit']
             
-            # Convert labels to binary (1 = profitable, 0 = loss)
-            # Original label is 1 (profit) or -1 (loss)
-            # Apply minimum profit threshold if configured
-            min_profit_threshold = training_config.get('min_profit_threshold', 0.0)
-            
-            if min_profit_threshold > 0:
-                # Only consider trades with profit > threshold as wins
-                # This helps find bigger winners by treating small profits as losses
-                profits = labels_df['profit']
-                binary_labels = (profits > min_profit_threshold).astype(int)
-                
-                original_wins = (labels_df['label'] > 0).sum()
-                filtered_wins = binary_labels.sum()
-                filtered_pct = (filtered_wins / len(binary_labels) * 100) if len(binary_labels) > 0 else 0
-                
-                logging.info(f"DEBUG: Applied min_profit_threshold={min_profit_threshold:.4f}")
-                logging.info(f"DEBUG: Original wins: {original_wins}/{len(binary_labels)}, Filtered wins: {filtered_wins}/{len(binary_labels)} ({filtered_pct:.1f}%)")
-                
-                # Show profit distribution of filtered trades
-                if filtered_wins > 0:
-                    big_winner_profits = profits[binary_labels == 1]
-                    logging.info(f"DEBUG: Big winner profits - Mean: {big_winner_profits.mean():.6f}, Median: {big_winner_profits.median():.6f}")
-            else:
-                # Standard binary labels (profit vs loss)
-                binary_labels = (labels_df['label'] > 0).astype(int)
-                profits = labels_df['profit']
-            
-            logging.info(f"DEBUG: Label statistics - Profitable: {(binary_labels == 1).sum()}/{len(binary_labels)} ({(binary_labels == 1).mean()*100:.1f}%)")
             logging.info(f"DEBUG: Profit statistics - Mean: {profits.mean():.6f}, Median: {profits.median():.6f}, Std: {profits.std():.6f}")
-            
-            logging.info(f"DEBUG: Final aligned data - features: {features.shape}, binary_labels: {len(binary_labels)}, profits: {len(profits)}")
+            logging.info(f"DEBUG: Final aligned data - features: {features.shape}, profits: {len(profits)}")
             
             # Verify indices match
-            if not features.index.equals(binary_labels.index):
+            if not features.index.equals(profits.index):
                 logging.error(f"DEBUG: Index mismatch after processing!")
                 logging.error(f"Features index: {features.index[:5]}...")
-                logging.error(f"Labels index: {binary_labels.index[:5]}...")
+                logging.error(f"Profits index: {profits.index[:5]}...")
                 dates_skipped.append(date_str)
                 continue
             
@@ -672,55 +626,69 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
             # Make predictions if model exists
             if model is not None and selected_features is not None:
                 logging.info(f"DEBUG: Making predictions for {date_str}")
-                logging.info(f"DEBUG: Model type: {type(model)}")
-                logging.info(f"DEBUG: Selected features: {len(selected_features)}")
-                logging.info(f"DEBUG: Features for prediction: {features.shape}")
                 
                 predictions = predict_model(model, features, selected_features)
                 
                 if len(predictions) > 0:
                     logging.info(f"DEBUG: Received {len(predictions)} predictions")
                     
-                    # IMPORTANT: Align test labels and profits with the actual prediction indices
-                    # The prediction function may have removed duplicates or NaN values
-                    test_labels_aligned = binary_labels.loc[predictions.index]
+                    # Align test profits with the actual prediction indices
                     profits_aligned = profits.loc[predictions.index]
                     
-                    logging.info(f"DEBUG: Aligned data - predictions: {len(predictions)}, test_labels: {len(test_labels_aligned)}, profits: {len(profits_aligned)}")
-                    
-                    # Verify alignment
-                    if len(predictions) != len(test_labels_aligned) or len(predictions) != len(profits_aligned):
-                        logging.error(f"DEBUG: Alignment failed! Predictions: {len(predictions)}, Labels: {len(test_labels_aligned)}, Profits: {len(profits_aligned)}")
-                        continue
+                    logging.info(f"DEBUG: Aligned data - predictions: {len(predictions)}, test_profits: {len(profits_aligned)}")
                     
                     all_predictions = pd.concat([all_predictions, predictions])
-                    all_test_labels = pd.concat([all_test_labels, test_labels_aligned])
-                    all_profits = pd.concat([all_profits, profits_aligned])
+                    all_test_profits = pd.concat([all_test_profits, profits_aligned])
                     
-                    logging.info(f"DEBUG: Total accumulated - predictions: {len(all_predictions)}, test_labels: {len(all_test_labels)}, profits: {len(all_profits)}")
+                    logging.info(f"DEBUG: Total accumulated - predictions: {len(all_predictions)}, test_profits: {len(all_test_profits)}")
                     
-                    # Verify accumulated data alignment
-                    if len(all_predictions) != len(all_test_labels) or len(all_predictions) != len(all_profits):
-                        logging.error(f"DEBUG: Accumulated data misalignment!")
-                        logging.error(f"Predictions: {len(all_predictions)}, Test labels: {len(all_test_labels)}, Profits: {len(all_profits)}")
-                        continue
+                    # Validate data before calculating metrics
+                    if all_predictions.isna().any():
+                        logging.warning(f"Found {all_predictions.isna().sum()} NaN in accumulated predictions")
+                        all_predictions = all_predictions.dropna()
+                        all_test_profits = all_test_profits.loc[all_predictions.index]
+                        logging.info(f"DEBUG: After cleaning predictions - predictions: {len(all_predictions)}, test_profits: {len(all_test_profits)}")
                     
-                    # Evaluate current performance - simplified version for logging
-                    threshold_50 = (all_predictions >= 0.5).astype(int)
-                    current_accuracy = accuracy_score(all_test_labels, threshold_50)
-                    current_profit = all_profits[all_predictions >= 0.5].sum()
-                    current_trades = (all_predictions >= 0.5).sum()
-                    current_mean_profit = all_profits[all_predictions >= 0.5].mean() if current_trades > 0 else 0
+                    if all_test_profits.isna().any():
+                        logging.warning(f"Found {all_test_profits.isna().sum()} NaN in accumulated test_profits")
+                        all_test_profits = all_test_profits.dropna()
+                        all_predictions = all_predictions.loc[all_test_profits.index]
+                        logging.info(f"DEBUG: After cleaning test_profits - predictions: {len(all_predictions)}, test_profits: {len(all_test_profits)}")
                     
-                    logging.info(f"Current performance (threshold 0.5):")
-                    logging.info(f"  Accuracy: {current_accuracy:.3f}, Total Profit: {current_profit:.6f}")
-                    logging.info(f"  Trades: {current_trades}, Mean Profit: {current_mean_profit:.6f}")
-                else:
-                    logging.warning(f"DEBUG: No predictions returned for {date_str}")
+                    # Only calculate metrics if we have valid data
+                    if len(all_predictions) > 0 and len(all_test_profits) > 0:
+                        # Evaluate current performance
+                        try:
+                            mse = mean_squared_error(all_test_profits, all_predictions)
+                            mae = mean_absolute_error(all_test_profits, all_predictions)
+                            r2 = r2_score(all_test_profits, all_predictions)
+                        except Exception as e:
+                            logging.error(f"Error calculating metrics: {e}")
+                            logging.error(f"all_predictions has NaN: {all_predictions.isna().any()}, all_test_profits has NaN: {all_test_profits.isna().any()}")
+                            mse = mae = r2 = 0.0
+                        
+                        # Trading metrics (take trades with predicted profit > 0)
+                        positive_pred_mask = all_predictions > 0
+                        if positive_pred_mask.sum() > 0:
+                            actual_profit_on_positive = all_test_profits[positive_pred_mask].sum()
+                            mean_actual_profit = all_test_profits[positive_pred_mask].mean()
+                            trade_count = positive_pred_mask.sum()
+                            win_rate = (all_test_profits[positive_pred_mask] > 0).mean()
+                        else:
+                            actual_profit_on_positive = 0
+                            mean_actual_profit = 0
+                            trade_count = 0
+                            win_rate = 0
+                        
+                        logging.info(f"Current performance:")
+                        logging.info(f"  MSE: {mse:.8f}, MAE: {mae:.6f}, R2: {r2:.4f}")
+                        logging.info(f"  Trades (pred>0): {trade_count}, Total Profit: {actual_profit_on_positive:.6f}")
+                        logging.info(f"  Mean Profit: {mean_actual_profit:.6f}, Win Rate: {win_rate:.3f}")
+                    else:
+                        logging.warning(f"No valid data for metrics calculation")
             
             # Accumulate training data
-            logging.info(f"DEBUG: Before accumulation - all_features: {all_features.shape}, all_labels: {len(all_labels)}")
-            logging.info(f"DEBUG: Adding current data - features: {features.shape}, labels: {len(binary_labels)}")
+            logging.info(f"DEBUG: Before accumulation - all_features: {all_features.shape}, all_profits: {len(all_profits)}")
             
             # Check for duplicate indices before accumulating
             if len(all_features) > 0:
@@ -728,52 +696,34 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
                 if len(duplicate_indices) > 0:
                     logging.warning(f"DEBUG: Found {len(duplicate_indices)} duplicate indices, removing from new data")
                     features = features.loc[~features.index.isin(duplicate_indices)]
-                    binary_labels = binary_labels.loc[~binary_labels.index.isin(duplicate_indices)]
-                    logging.info(f"DEBUG: After duplicate removal - features: {features.shape}, labels: {len(binary_labels)}")
+                    profits = profits.loc[~profits.index.isin(duplicate_indices)]
+                    logging.info(f"DEBUG: After duplicate removal - features: {features.shape}, profits: {len(profits)}")
             
             all_features = pd.concat([all_features, features])
-            all_labels = pd.concat([all_labels, binary_labels])
+            all_profits = pd.concat([all_profits, profits])
             
-            logging.info(f"DEBUG: After accumulation - all_features: {all_features.shape}, all_labels: {len(all_labels)}")
-            
-            # Check for duplicates in accumulated data
-            if all_features.index.duplicated().any():
-                logging.warning(f"DEBUG: Found duplicated indices in accumulated features: {all_features.index.duplicated().sum()}")
-                all_features = all_features[~all_features.index.duplicated(keep='first')]
-                all_labels = all_labels[~all_labels.index.duplicated(keep='first')]
-                logging.info(f"DEBUG: After deduplication - all_features: {all_features.shape}, all_labels: {len(all_labels)}")
+            logging.info(f"DEBUG: After accumulation - all_features: {all_features.shape}, all_profits: {len(all_profits)}")
             
             # Retrain model if conditions are met
+            # Use i (day index) for min_train_days check, not len(all_features) (sample count)
             should_retrain = (
                 (i % retrain_frequency == 0 and i >= min_train_days) or
-                (model is None and len(all_features) >= min_train_days)
+                (model is None and i >= min_train_days)
             )
             
             if should_retrain:
-                logging.info(f"Retraining model with {len(all_features)} samples")
+                logging.info(f"Retraining model with {len(all_features)} samples from {i+1} days")
                 
                 try:
                     model, selected_features = train_model(
                         all_features, 
-                        all_labels, 
+                        all_profits, 
                         training_config, 
                         n_jobs
                     )
                     
-                    # Verify model was trained correctly
                     logging.info(f"DEBUG TRAINING: Model trained successfully")
                     logging.info(f"DEBUG TRAINING: Selected features: {len(selected_features)}")
-                    logging.info(f"DEBUG TRAINING: Model classes: {getattr(model, 'classes_', 'N/A')}")
-                    logging.info(f"DEBUG TRAINING: Training data shape: {all_features[selected_features].shape}")
-                    
-                    # Test the model with a small sample to verify it works
-                    test_sample = all_features[selected_features].iloc[:5]
-                    try:
-                        test_pred = model.predict_proba(test_sample)
-                        logging.info(f"DEBUG TRAINING: Model test prediction successful, shape: {test_pred.shape}")
-                    except Exception as test_e:
-                        logging.error(f"DEBUG TRAINING: Model test prediction failed: {str(test_e)}")
-                        raise test_e
                     
                     # Save model info
                     model_info = {
@@ -810,151 +760,144 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
     if len(all_predictions) > 0:
         logging.info("Generating final evaluation results...")
         
-        # Create detailed predictions dataframe like in train_events.py
-        predictions_df = pd.DataFrame({
-            'true_label': all_test_labels,
-            'prediction_proba': all_predictions,
-            'profit': all_profits
-        })
+        # Clean accumulated predictions and test profits before final evaluation
+        logging.info(f"DEBUG: Pre-cleaning - predictions: {len(all_predictions)}, test_profits: {len(all_test_profits)}")
+        logging.info(f"DEBUG: Predictions has NaN: {all_predictions.isna().any()}, Test profits has NaN: {all_test_profits.isna().any()}")
         
-        # Add additional columns
-        predictions_df['trade_date'] = predictions_df.index.date
-        predictions_df['exit_price'] = predictions_df['profit'] + 1.0  # Assuming profit is in decimal form
-        predictions_df['return'] = predictions_df['profit']
+        if all_predictions.isna().any():
+            logging.warning(f"Found {all_predictions.isna().sum()} NaN in final predictions, removing...")
+            all_predictions = all_predictions.dropna()
+            all_test_profits = all_test_profits.loc[all_predictions.index]
         
-        # Evaluate across multiple thresholds like train_events.py
-        thresholds = np.arange(0.0, 1.05, 0.05)
+        if all_test_profits.isna().any():
+            logging.warning(f"Found {all_test_profits.isna().sum()} NaN in final test profits, removing...")
+            all_test_profits = all_test_profits.dropna()
+            all_predictions = all_predictions.loc[all_test_profits.index]
         
-        precisions = []
-        recalls = []
-        f1s = []
-        accuracies = []
-        profits = []
-        mean_profits = []
-        median_profits = []
-        counts = []
+        logging.info(f"DEBUG: Post-cleaning - predictions: {len(all_predictions)}, test_profits: {len(all_test_profits)}")
+        
+        if len(all_predictions) == 0 or len(all_test_profits) == 0:
+            logging.error("No valid predictions after cleaning! Cannot generate results.")
+        else:
+            # Create detailed predictions dataframe
+            predictions_df = pd.DataFrame({
+                'predicted_profit': all_predictions,
+                'actual_profit': all_test_profits
+            })
+            
+            # Add additional columns
+            predictions_df['trade_date'] = predictions_df.index.date
+            predictions_df['prediction_error'] = predictions_df['actual_profit'] - predictions_df['predicted_profit']
+            predictions_df['abs_error'] = predictions_df['prediction_error'].abs()
+            
+            # Calculate overall regression metrics
+            try:
+                mse = mean_squared_error(all_test_profits, all_predictions)
+                mae = mean_absolute_error(all_test_profits, all_predictions)
+                r2 = r2_score(all_test_profits, all_predictions)
+                rmse = np.sqrt(mse)
+            except Exception as e:
+                logging.error(f"Error calculating final metrics: {e}")
+                mse = mae = r2 = rmse = 0.0
+        
+        logging.info("="*60)
+        logging.info("REGRESSION MODEL PERFORMANCE")
+        logging.info("="*60)
+        logging.info(f"Mean Squared Error (MSE): {mse:.8f}")
+        logging.info(f"Root Mean Squared Error (RMSE): {rmse:.6f}")
+        logging.info(f"Mean Absolute Error (MAE): {mae:.6f}")
+        logging.info(f"R-squared (R2): {r2:.4f}")
+        logging.info("-"*60)
+        
+        # Evaluate across multiple profit thresholds for trading decisions
+        # Include -inf to show ALL predictions (baseline: take all signals regardless of predicted profit)
+        # This is equivalent to the classification approach where all signals are traded
+        thresholds = [-np.inf, 0.0, 0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01]
+        
+        threshold_results = []
         
         for threshold in thresholds:
-            logging.info(f"Evaluating threshold {threshold:.2f}")
+            # Take trades where predicted profit > threshold
+            trade_mask = all_predictions >= threshold
             
-            # Convert probabilities to binary predictions
-            y_pred_binary = (all_predictions >= threshold).astype(int)
-            
-            # Calculate classification metrics
-            accuracy = accuracy_score(all_test_labels, y_pred_binary)
-            precision = precision_score(all_test_labels, y_pred_binary, zero_division=0)
-            recall = recall_score(all_test_labels, y_pred_binary, zero_division=0)
-            f1 = f1_score(all_test_labels, y_pred_binary, zero_division=0)
-            
-            # Calculate trading metrics
-            selected_trades = all_predictions >= threshold
-            total_profit = all_profits[selected_trades].sum() if selected_trades.any() else 0
-            mean_profit = all_profits[selected_trades].mean() if selected_trades.any() else 0
-            median_profit = all_profits[selected_trades].median() if selected_trades.any() else 0
-            trade_count = selected_trades.sum()
-            
-            # Store results
-            accuracies.append(accuracy)
-            precisions.append(precision)
-            recalls.append(recall)
-            f1s.append(f1)
-            profits.append(total_profit)
-            mean_profits.append(mean_profit)
-            median_profits.append(median_profit)
-            counts.append(trade_count)
-            
-            # Create filtered predictions for this threshold
-            threshold_predictions = predictions_df[predictions_df['prediction_proba'] >= threshold].copy()
-            
-            if len(threshold_predictions) > 0:
-                # Daily aggregation like train_events.py
-                daily_results = threshold_predictions.groupby('trade_date')['profit'].agg(['count', 'sum', 'mean'])
-                daily_results['cumsum'] = threshold_predictions.groupby('trade_date')['profit'].sum().cumsum()
-                daily_results['total_signals'] = daily_results['count'].cumsum()
-                daily_results['total_mean'] = daily_results['cumsum'] / daily_results['total_signals']
-                daily_results['drawdown'] = daily_results['cumsum'] - daily_results['cumsum'].cummax()
+            if trade_mask.sum() > 0:
+                trade_count = trade_mask.sum()
+                total_profit = all_test_profits[trade_mask].sum()
+                mean_profit = all_test_profits[trade_mask].mean()
+                median_profit = all_test_profits[trade_mask].median()
+                win_rate = (all_test_profits[trade_mask] > 0).mean()
                 
-                # Save daily results
-                threshold_str = f"{threshold:.2f}".replace('.', '_')
-                daily_file = results_dir / f"daily_{threshold_str}.csv.bz2"
-                daily_results.to_csv(daily_file)
-                
-                # Save detailed predictions for this threshold
-                predictions_file = results_dir / f"predicted_results_{threshold_str}.csv.bz2"
-                threshold_predictions.to_csv(predictions_file)
+                # Prediction accuracy for selected trades
+                try:
+                    selected_mse = mean_squared_error(all_test_profits[trade_mask], all_predictions[trade_mask])
+                    selected_mae = mean_absolute_error(all_test_profits[trade_mask], all_predictions[trade_mask])
+                except Exception as e:
+                    logging.warning(f"Error calculating metrics for threshold {threshold}: {e}")
+                    selected_mse = 0.0
+                    selected_mae = 0.0
+            else:
+                trade_count = 0
+                total_profit = 0
+                mean_profit = 0
+                median_profit = 0
+                win_rate = 0
+                selected_mse = 0
+                selected_mae = 0
+            
+            threshold_results.append({
+                'threshold': threshold,
+                'count': trade_count,
+                'total_profit': total_profit,
+                'mean_profit': mean_profit,
+                'median_profit': median_profit,
+                'win_rate': win_rate,
+                'mse': selected_mse,
+                'mae': selected_mae
+            })
         
-        # Create comprehensive results summary
-        final_results = pd.DataFrame({
-            'threshold': thresholds,
-            'count': counts,
-            'accuracy': accuracies,
-            'precision': precisions,
-            'recall': recalls,
-            'f1': f1s,
-            'total_profit': profits,
-            'mean_profit': mean_profits,
-            'median_profit': median_profits,
-        })
+        # Create results DataFrame
+        final_results = pd.DataFrame(threshold_results)
         
         # Save results
         final_results.to_csv(results_dir / "evaluation_results.csv", index=False)
         final_results.to_parquet(results_dir / "evaluation_results.parquet")
-        final_results.to_parquet(results_dir / "results.parquet")  # train_events.py naming
+        final_results.to_parquet(results_dir / "results.parquet")
         
         # Save all predictions
         predictions_df.to_parquet(results_dir / "all_predictions.parquet")
-        predictions_df.to_parquet(results_dir / "predicted_results.parquet")  # train_events.py naming
+        predictions_df.to_parquet(results_dir / "predicted_results.parquet")
         
-        # Daily profit summary (like train_events.py)
-        daily_profit = predictions_df.groupby('trade_date')['profit'].sum()
+        # Daily profit summary
+        daily_profit = predictions_df.groupby('trade_date')['actual_profit'].sum()
         daily_profit.to_csv(results_dir / "daily.csv.bz2")
         
-        # Print detailed summary like train_events.py
-        best_f1_row = final_results.loc[final_results['f1'].idxmax()]
+        # Print detailed summary
         best_profit_row = final_results.loc[final_results['total_profit'].idxmax()]
-        best_sharpe_threshold = 0.5  # You can calculate Sharpe ratio if needed
         
         logging.info("="*60)
-        logging.info("FINAL RESULTS SUMMARY")
+        logging.info("TRADING PERFORMANCE SUMMARY")
         logging.info("="*60)
         logging.info(f"Total predictions made: {len(all_predictions)}")
-        logging.info(f"Total profit (all trades): {all_profits.sum():.6f}")
-        logging.info(f"Mean profit per trade: {all_profits.mean():.6f}")
-        logging.info(f"Median profit per trade: {all_profits.median():.6f}")
-        logging.info(f"Win rate (profitable trades): {(all_profits > 0).mean():.3f}")
+        logging.info(f"Total profit (all pred>0): {all_test_profits[all_predictions > 0].sum():.6f}")
+        logging.info(f"Mean predicted profit: {all_predictions.mean():.6f}")
+        logging.info(f"Mean actual profit (all): {all_test_profits.mean():.6f}")
         logging.info("-"*60)
-        logging.info(f"Best F1 Score: {best_f1_row['f1']:.3f} at threshold {best_f1_row['threshold']:.2f}")
-        logging.info(f"  - Trades: {best_f1_row['count']}, Total Profit: {best_f1_row['total_profit']:.6f}")
-        logging.info(f"  - Mean Profit: {best_f1_row['mean_profit']:.6f}")
-        logging.info("-"*60)
-        logging.info(f"Best Total Profit: {best_profit_row['total_profit']:.6f} at threshold {best_profit_row['threshold']:.2f}")
-        logging.info(f"  - Trades: {best_profit_row['count']}, F1 Score: {best_profit_row['f1']:.3f}")
+        logging.info(f"Best Total Profit: {best_profit_row['total_profit']:.6f} at threshold {best_profit_row['threshold']:.4f}")
+        logging.info(f"  - Trades: {best_profit_row['count']}, Win Rate: {best_profit_row['win_rate']:.3f}")
         logging.info(f"  - Mean Profit: {best_profit_row['mean_profit']:.6f}")
         logging.info("-"*60)
         
         # Show top performing thresholds
-        top_profit_thresholds = final_results.nlargest(5, 'total_profit')[['threshold', 'total_profit', 'count', 'mean_profit', 'f1']]
+        top_profit_thresholds = final_results.nlargest(5, 'total_profit')
         logging.info("Top 5 thresholds by total profit:")
         for _, row in top_profit_thresholds.iterrows():
-            logging.info(f"  {row['threshold']:.2f}: Profit={row['total_profit']:.6f}, "
-                        f"Trades={row['count']}, Mean={row['mean_profit']:.6f}, F1={row['f1']:.3f}")
+            logging.info(f"  {row['threshold']:.4f}: Profit={row['total_profit']:.6f}, "
+                        f"Trades={row['count']}, Mean={row['mean_profit']:.6f}, WinRate={row['win_rate']:.3f}")
         
         logging.info("-"*60)
         logging.info(f"Results saved to: {results_dir}")
         
-        # Print processing statistics
-        logging.info("\n" + "="*60)
-        logging.info("TRAINING SUMMARY")
-        logging.info("="*60)
-        logging.info(f"Total dates processed: {len(dates_processed)}")
-        logging.info(f"Total dates skipped: {len(dates_skipped)}")
-        logging.info(f"Dates with predictions: {len(dates_with_predictions)}")
-        logging.info(f"Dates with training: {len(dates_with_training)}")
-        
-        if dates_skipped:
-            logging.info(f"\nSkipped dates: {', '.join(dates_skipped[:20])}{'...' if len(dates_skipped) > 20 else ''}")
-        
-        # Print complete results table for all thresholds
+        # Print complete results table
         logging.info("\nComplete Results for All Thresholds:")
         logging.info("="*120)
         logging.info(final_results.to_string(index=False))
@@ -967,36 +910,31 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
             logging.info("="*60)
             
             try:
-                # Get feature importances from the trained model
-                # Handle both RandomForest and BaggingClassifier
-                if isinstance(model, BaggingClassifier):
-                    # For BaggingClassifier, aggregate importances from all base estimators
-                    logging.info("Extracting feature importances from BaggingClassifier...")
+                # Get feature importances
+                if isinstance(model, BaggingRegressor):
+                    logging.info("Extracting feature importances from BaggingRegressor...")
                     importances_list = []
                     for estimator in model.estimators_:
                         if hasattr(estimator, 'feature_importances_'):
                             importances_list.append(estimator.feature_importances_)
                     
                     if importances_list:
-                        # Average importance across all estimators
                         feature_importances = np.mean(importances_list, axis=0)
                         logging.info(f"Aggregated importances from {len(importances_list)} estimators")
                     else:
                         logging.warning("No feature importances found in base estimators")
                         feature_importances = None
+                elif isinstance(model, GradientBoostingRegressor):
+                    feature_importances = model.feature_importances_
                 else:
-                    # For RandomForestClassifier, directly access feature_importances_
                     feature_importances = model.feature_importances_
                 
-                # Only proceed if we successfully extracted feature importances
                 if feature_importances is not None:
-                    # Create a dataframe with features and their importance
                     importance_df = pd.DataFrame({
                         'feature': selected_features,
                         'importance': feature_importances
                     }).sort_values('importance', ascending=False)
                     
-                    # Add family column
                     importance_df['family'] = importance_df['feature'].apply(extract_family_key)
                     
                     # Save to file
@@ -1013,7 +951,7 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
                         rank = idx + 1
                         logging.info(f"{rank:<6} {row['feature']:<25} {row['family']:<15} {row['importance']:<12.6f}")
                     
-                    # Group by family and show aggregate importance
+                    # Group by family
                     family_importance = importance_df.groupby('family')['importance'].agg(['sum', 'mean', 'count']).sort_values('sum', ascending=False)
                     
                     logging.info("\n" + "-"*80)
@@ -1026,17 +964,11 @@ def main(config, start_train_date, end_date, retrain_frequency, min_train_days, 
                         logging.info(f"{family:<20} {row['sum']:<15.6f} {row['mean']:<15.6f} {int(row['count']):<10}")
                     
                     logging.info("-"*80)
-                    logging.info(f"Feature importance saved to: {results_dir / 'feature_importance.csv'}")
-                else:
-                    logging.warning("Could not extract feature importances from model")
                 
             except Exception as e:
                 logging.error(f"Error calculating feature importance: {str(e)}")
                 import traceback
                 logging.error(traceback.format_exc())
-        else:
-            logging.warning("No model available for feature importance analysis")
-        
     else:
         logging.warning("No predictions were made. Check your data and configuration.")
 

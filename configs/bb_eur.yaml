@@ -1,0 +1,59 @@
+# Bollinger Band Mean Reversion with Different Exit Strategies
+# Compare 4 different BB exit approaches on USDJPY
+
+spot: "EURUSD"
+offsets: [0, 1, 2, 3]
+start_date: "01022025"
+end_date: "09302025"
+
+
+use_lagged_profit_features: false
+
+
+time_filter:
+  start_hour_est: 2   # 2am EST = 7am GMT
+  end_hour_est: 12    # 12pm EST = 5pm GMT
+
+# Signal strategy: BB mean reversion (enter on band touch)
+signal_strategy: "bb_mean_reversion"
+signal_params:
+  bb_window: 20
+  bb_std: 2.5
+  use_rsi_filter: false
+
+# Compare 4 BB exit strategies
+labels:
+  # Strategy 1: Exit at middle band (MA line) - Quickest exits, highest win rate
+  bb_middle:
+    use_bb_exit: true
+    bb_exit_strategy: "middle"
+    bb_window: 20          # Must match signal params
+    bb_std: 2.5
+  
+  # Strategy 2: Exit at opposite band - Maximum profit potential
+  bb_opposite:
+    use_bb_exit: true
+    bb_exit_strategy: "opposite_band"
+    bb_window: 20
+    bb_std: 2.5
+  
+  # Strategy 3: Exit at partial reversion (50% to middle)
+  bb_partial_50:
+    pt: 0.003
+    sl: 0.001
+    max_hold: 36
+    use_bb_exit: true
+    bb_exit_strategy: "partial"
+    bb_window: 20
+    bb_std: 2.5
+    exit_std_multiplier: 0.5  # Exit at MA ± 0.5*std (halfway to middle)
+  
+  # Strategy 4: Exit on opposite signal (signal reversal)
+  bb_signal:
+    pt: 0.003
+    sl: 0.001
+    max_hold: 48
+    use_bb_exit: true
+    bb_exit_strategy: "signal"
+    bb_window: 20
+    bb_std: 2.5

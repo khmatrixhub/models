@@ -4,6 +4,8 @@ import numpy as np
 from scipy.stats import pearsonr
 import matplotlib.pyplot as plt
 
+from equity_from_decisions import plot_from_decisions, write_stats
+
 # ---------------- v5 helpers (unchanged) ---------------- #
 
 def log(msg):
@@ -225,42 +227,8 @@ def main():
     dec_df.to_csv(out_log, index=False)
     plot_from_decisions(out_log, out_png=out_equity,
                     title=f"Equity from decisions (top-{args.top_k}, lookback={look})")
-    fus = pd.DataFrame(feat_usage_rows).fillna(0.0).drop(columns=["date"], errors="ignore").sum().rename("count").to_frame()
-    fus.to_csv(out_feats)
 
-    # Build evaluation arrays aligned with decisions
-    eq_idx_start = look+1
-    eq_dates = df[args.date_col].values[eq_idx_start:]
-    pnl1_eval = pnl1[eq_idx_start:]
-    pnl2_eval = pnl2[eq_idx_start:]
-    choose1_eval = np.array(choose1_list[1:])  # shift to t+1
-    min_len = min(len(eq_dates), len(choose1_eval), len(pnl1_eval), len(pnl2_eval))
-    eq_dates = eq_dates[:min_len]; pnl1_eval = pnl1_eval[:min_len]; pnl2_eval = pnl2_eval[:min_len]
-    choose1_eval = choose1_eval[:min_len]
-    adapt_eval = choose1_eval * pnl1_eval + (1 - choose1_eval) * pnl2_eval
-
-    eq1 = np.cumsum(pnl1_eval)
-    eq2 = np.cumsum(pnl2_eval)
-    eqA = np.cumsum(adapt_eval)
-    #equity_plot(eq_dates, eq1, eq2, eqA, out_equity,
-    #            f"Walk-forward top-{args.top_k}, lookback={look} (GLOBAL={global_mapping})")
-
-    # quick stats (same calc style as earlier)
-    def stats_row(label, pnl):
-        eq = np.cumsum(pnl)
-        return {
-            "strategy": label,
-            "total_trades": float(len(pnl)),  # daily bars; for per-trade, use counts if you prefer
-            "total_pnl": float(pnl.sum()),
-            "avg_pnl_per_trade": float(pnl.mean()),
-            "max_drawdown": max_drawdown(eq),
-            "sharpe_ratio": sharpe_ratio(pnl),
-        }
-    pd.DataFrame([
-        stats_row("Always_1", pnl1_eval),
-        stats_row("Always_2", pnl2_eval),
-        stats_row("Adaptive", adapt_eval),
-    ]).to_csv(out_stats, index=False)
+    write_stats(out_log, out_stats, fee_per_trade=0)
 
     log(f"Saved equity: {out_equity}")
     log(f"Saved decisions: {out_log}")

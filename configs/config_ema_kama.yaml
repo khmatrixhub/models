@@ -1,0 +1,60 @@
+# EMA/KAMA Crossover Strategy Configuration
+# Fast EMA crosses adaptive KAMA for responsive yet stable signals
+
+spot: "USDJPY"
+offsets: [0, 1, 2, 3]
+start_date: "01022025"
+end_date: "09302025"
+
+# Signal strategy: EMA/KAMA crossover
+signal_strategy: "ema_kama_cross"
+
+# MA windows for signal generation
+ma_windows:
+  fast: 5  # Fast EMA (responsive to price changes)
+
+# KAMA parameters (slow MA with adaptive behavior)
+# KAMA adapts between fast_ema and slow_ema based on market efficiency
+slow_period: 10        # Lookback period for efficiency ratio calculation
+slow_fast_ema: 4       # Fast EMA period for trending markets (KAMA becomes responsive)
+slow_slow_ema: 12      # Slow EMA period for ranging markets (KAMA becomes smooth)
+
+# Note: KAMA automatically adjusts:
+# - In strong trends: behaves like 2-period EMA (very responsive)
+# - In choppy markets: behaves like 30-period EMA (very smooth)
+# - In between: adaptively blends based on trend strength
+
+# Exit strategies with standard PT/SL
+labels:
+  # Conservative: Small targets, 24h hold
+  conservative:
+    pt: 0.001
+    sl: 0.001
+    max_hold: 24
+    use_ma_exit: false
+    use_bb_exit: false
+  
+  # Aggressive: Larger targets, 48h hold
+  aggressive:
+    pt: 0.002
+    sl: 0.001
+    max_hold: 48
+    use_ma_exit: false
+    use_bb_exit: false
+  
+  # MA signal exit: Exit on opposite EMA/KAMA crossover
+  ma_crossover:
+    pt: null  # No PT (rely on signal reversal)
+    sl: null # Backup stop loss
+    max_hold: null  # No time limit (wait for signal)
+    use_ma_exit: true
+    use_bb_exit: false
+
+# Lagged profit features (enabled by default)
+use_lagged_profit_features: false
+
+# Optional: Time-of-day filter for signal generation
+# Uncomment to restrict trading to specific hours (EST)
+time_filter:
+  start_hour_est: 2
+  end_hour_est: 12

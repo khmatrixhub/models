@@ -1,0 +1,39 @@
+# Bollinger Band Mean Reversion with Time-of-Day Filter
+# Restrict trading signals to 2am-12pm NY time (7am-5pm GMT)
+
+spot: "EURUSD"
+offsets: [0, 1, 2, 3]
+start_date: "01022025"
+end_date: "09302025"
+
+# Disable lagged profit features to eliminate NaN dropout
+use_lagged_profit_features: false
+
+# Time filter: Only enter trades during these hours (EST/NY time)
+# Positions can be held outside this window, but no new entries
+time_filter:
+  start_hour_est: 2   # 2am EST = 7am GMT
+  end_hour_est: 12    # 12pm EST = 5pm GMT
+
+# Signal strategy: BB mean reversion (enter on band touch)
+signal_strategy: "bb_mean_reversion"
+signal_params:
+  bb_window: 20
+  bb_std: 2.5
+  use_rsi_filter: false
+
+# Compare 2 BB exit strategies (same as bb_eur_no_lag.yaml subset)
+labels:
+  # Strategy 1: Exit at middle band (MA line) - Quickest exits, highest win rate
+  bb_middle:
+    use_bb_exit: true
+    bb_exit_strategy: "middle"
+    bb_window: 20          # Must match signal params
+    bb_std: 2.5
+  
+  # Strategy 2: Exit at opposite band - Maximum profit potential
+  bb_opposite:
+    use_bb_exit: true
+    bb_exit_strategy: "opposite_band"
+    bb_window: 20
+    bb_std: 2.5

@@ -128,31 +128,61 @@ offsets: [0, 1, 2, 3]
 start_date: "01022025"
 end_date: "01312025"
 
+# Signal strategy selection
+signal_strategy: "ma_crossover"  # or "bb_mean_reversion"
+signal_params:
+  bb_window: 20     # For BB strategy
+  bb_std: 2.0
+  use_rsi_filter: false
+
+# Exit strategies (3 types available)
 labels:
+  # 1. Standard PT/SL exits
   conservative:
     pt: 0.001
     sl: 0.001
     max_hold: 24
     use_ma_exit: false
+    use_bb_exit: false
   
-  aggressive:
-    pt: 0.002
-    sl: 0.001
-    max_hold: 48
-    use_ma_exit: false
-  
-  swing:
-    pt: 0.005
-    sl: 0.001
-    max_hold: 120
-    use_ma_exit: false
-  
+  # 2. MA signal-based exits
   ma_crossover:
     pt: null
     sl: null
     max_hold: null
     use_ma_exit: true
+  
+  # 3. BB mean reversion exits (4 strategies)
+  bb_middle:
+    pt: 0.002              # Backup exit
+    sl: 0.001
+    max_hold: 24
+    use_bb_exit: true
+    bb_exit_strategy: "middle"  # middle | opposite_band | partial | signal
+    bb_window: 20          # MUST match signal_params
+    bb_std: 2.0
+    exit_std_multiplier: 0.5  # For 'partial' strategy only
 ```
+
+### Exit Strategy Types
+
+**1. Standard PT/SL** (`use_ma_exit=false, use_bb_exit=false`)
+- Traditional profit target and stop loss
+- Fixed percentage exits
+- Max hold period as backup
+
+**2. MA Signal-Based** (`use_ma_exit=true`)
+- Exit on opposite MA crossover signal
+- No PT (set to null)
+- Best for trending strategies
+
+**3. BB Mean Reversion** (`use_bb_exit=true`)
+- 4 strategies: `middle`, `opposite_band`, `partial`, `signal`
+- **Middle**: Exit at MA line (fastest, highest win rate)
+- **Opposite Band**: Exit at opposite band (slowest, highest profit)
+- **Partial**: Exit at MA ± exit_std_multiplier*std (configurable)
+- **Signal**: Exit on opposite BB signal (regime-based)
+- PT/SL/max_hold still act as backup exits
 
 ## Key Patterns & Conventions
 
@@ -204,7 +234,16 @@ def add_signal_adjusted_features(features_df, signals):
     """
 ```
 
-**Multi-Strategy Loop** (lines 715-738):
+**Label Generation Functions**:
+- `generate_labels()` (lines 371-527): Standard PT/SL/max_hold exits
+- `generate_labels_ma_exit()` (lines 530-662): MA signal-based exits
+- `generate_labels_bb_exit()` (lines 664-847): BB mean reversion exits
+  - Supports 4 exit strategies: 'middle', 'opposite_band', 'partial', 'signal'
+  - Calculates BB dynamically for exit detection
+  - PT/SL/max_hold act as backup exits
+  - Returns labels with exit_reason column
+
+**Multi-Strategy Loop** (lines 1015-1060):
 ```python
 # Add lagged features for ALL strategies
 for label_name, label_info in labels.items():
@@ -266,6 +305,10 @@ predictions_dir = base_results_dir / "predictions" / experiment
 ## Documentation Files
 - `FOLDER_STRUCTURE.md` - Complete folder organization reference
 - `TRAINING_INTEGRATION.md` - How train.py integrates with folder structure
+- `BB_EXIT_STRATEGIES.md` - Comprehensive BB exit strategies guide
+- `BB_EXIT_QUICKSTART.md` - Quick start guide for BB exits
+- `BB_MEAN_REVERSION.md` - BB signal generation strategy
+- `TRAIN_COMPATIBILITY.md` - Model training integration
 - `environment.yml` - Conda environment specification
 
 ## Data Schema

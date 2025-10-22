@@ -2,12 +2,6 @@ spot: "USDJPY"
 start_date: "01022025"
 end_date: "09302025"
 
-
-time_filter:
-  start_hour_est: 2   # 2am EST = 7am GMT
-  end_hour_est: 12    # 12pm EST = 5pm GMT
-
-
 # Moving Average parameters for signal generation
 ma_windows:
   fast: 5   # Fast MA window (default: 5)
@@ -45,10 +39,8 @@ training:
   use_rfe: false
   max_features: 30
   max_features_per_family: 3
-  reverse_signals: false  # Set to true to flip all signals (long->short, short->long)
-  min_profit_threshold: 0.0  # Minimum profit to consider a "win" (e.g., 0.005 = 0.5%)
-                             # Trades with profit < threshold are labeled as losses
-                             # Use this to train model to find bigger winners
+  reverse_signals: true  # Set to true to flip all signals (long->short, short->long)
+  min_profit_threshold: 0.050
   bagging:
     enabled: true
     n_estimators: 200
