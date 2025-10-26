@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from fx_backtest_base import FXBacktester, calculate_statistics, print_statistics
 from fx_ltr_features import calculate_features  # NEW: Use modular features
+from fx_ltr_cs_features import apply_cross_sectional_blocks  # NEW: Cross-sectional features
 
 
 # =============================================================================
@@ -191,11 +192,14 @@ def generate_training_data_multiday(data_dir: Path, pairs: list, start_date: str
             timestamp = timestamps[idx]
             group_id = f"{date_str}_{timestamp}"
             
-            # For each pair, extract features and calculate label
+            # STEP 1: Build snapshot for all pairs at this timestamp
+            snapshot_rows = []
+            labels = {}
+            
             for pair in pair_data.keys():
                 df = pair_data[pair]
                 
-                # Extract features at current timestamp
+                # Extract per-pair features at current timestamp
                 df_history = df.iloc[:idx + 1]
                 features = calculate_features_with_filter(df_history, pair)
                 
@@ -218,16 +222,36 @@ def generate_training_data_multiday(data_dir: Path, pairs: list, start_date: str
                     # For EUR/USD etc, we long when ranked high (strong EUR)
                     next_hour_pnl = (future_price - current_price) / current_price
                 
-                # Create training row
-                row = {
+                # Store features and label
+                features_copy = features.copy()
+                features_copy['pair'] = pair
+                snapshot_rows.append(features_copy)
+                labels[pair] = next_hour_pnl
+            
+            # Skip if not enough pairs
+            if len(snapshot_rows) < 2:
+                continue
+            
+            # STEP 2: Apply cross-sectional transformations to snapshot
+            snapshot_df = pd.DataFrame(snapshot_rows)
+            snapshot_df = apply_cross_sectional_blocks(snapshot_df, prev_ranks=None)
+            
+            # STEP 3: Create training rows with CS features
+            for _, row in snapshot_df.iterrows():
+                pair = row['pair']
+                
+                # Create training row with all features (per-pair + CS)
+                training_row = {
                     'pair': pair,
                     'timestamp': timestamp,
                     'group_id': group_id,
-                    'label': next_hour_pnl,
+                    'label': labels[pair],
                 }
-                row.update(features)
                 
-                training_rows.append(row)
+                # Add all features (per-pair + cross-sectional)
+                training_row.update(row.drop('pair').to_dict())
+                
+                training_rows.append(training_row)
     
     df_train = pd.DataFrame(training_rows)
     
@@ -527,7 +551,7 @@ class LTRRanker:
     
     def rank_pairs(self, all_data: Dict[str, pd.DataFrame], idx: int) -> Dict[str, float]:
         """
-        Rank pairs using LTR model.
+        Rank pairs using LTR model with cross-sectional features.
         
         Args:
             all_data: Dictionary of pair -> DataFrame
@@ -541,7 +565,7 @@ class LTRRanker:
             print("WARNING: No trained model - using random rankings")
             return {pair: np.random.random() for pair in all_data.keys()}
         
-        # Calculate features for all pairs
+        # STEP 1: Calculate per-pair features for all pairs
         features_list = []
         pairs_list = []
         
@@ -550,15 +574,21 @@ class LTRRanker:
             if features:
                 # CRITICAL: Only include pairs that pass volatility filter
                 if features.get('is_tradeable', 0) == 1:
+                    features['pair'] = pair
                     features_list.append(features)
                     pairs_list.append(pair)
         
         if not features_list:
             return {pair: 0.0 for pair in all_data.keys()}
         
-        # Predict scores
-        features_df = pd.DataFrame(features_list)
-        scores = self.model.predict(features_df)
+        # STEP 2: Build snapshot and apply cross-sectional features
+        snapshot_df = pd.DataFrame(features_list)
+        
+        # TODO: Pass prev_ranks for turnover smoothing (store from previous rebalance)
+        snapshot_df = apply_cross_sectional_blocks(snapshot_df, prev_ranks=None)
+        
+        # STEP 3: Predict scores using model
+        scores = self.model.predict(snapshot_df)
         
         # Create ranking dictionary
         rankings = {pair: float(score) for pair, score in zip(pairs_list, scores)}
@@ -607,7 +637,7 @@ if __name__ == "__main__":
     print(f"USD Notional per position: $1,000,000")
     print(f"Trading Hours: {args.start_hour:02d}:00 - {args.end_hour:02d}:00 EST")
     print(f"Model Retraining: Every {args.retrain_frequency} days")
-    print(f"NEW Features: 40 features (37 modular + 3 filtering)")
+    print(f"NEW Features: ~80 features (37 per-pair + 40 cross-sectional + 3 filtering)")
     print(f"Volatility Filtering: Enabled (G7 pairs only)")
     print("=" * 80)
     print()
