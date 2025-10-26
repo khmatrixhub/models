@@ -1,0 +1,646 @@
+"""
+Learn-to-Rank (LTR) cross-sectional momentum strategy using shared base.
+
+Uses LightGBM to learn optimal pair rankings from features.
+All backtesting logic is shared with other strategies via fx_backtest_base.
+
+Usage:
+    python cross_mom/fx_ltr.py --start-date 01022025 --end-date 01102025 \
+        --rebalance-freq 60 --top-n 2 --training-days 30 --retrain-frequency 7
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import argparse
+import lightgbm as lgb
+from typing import Dict, Optional
+from datetime import datetime, timedelta
+import sys
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent))
+
+from fx_backtest_base import FXBacktester, calculate_statistics, print_statistics
+
+
+# =============================================================================
+# FEATURE ENGINEERING
+# =============================================================================
+
+def calculate_features(df: pd.DataFrame, pair: str) -> Dict[str, float]:
+    """
+    Calculate features for a single pair at current point in time.
+    Uses USD-normalized prices for consistent cross-sectional comparison.
+    MATCHES baseline fx_ltr_momentum_bidask.py exactly.
+    """
+    features = {}
+    
+    if len(df) < 120:
+        return features
+    
+    # Momentum features (returns and log_returns)
+    for w in [30, 60, 120]:
+        if len(df) < w:
+            features[f'returns_{w}'] = np.nan
+            features[f'log_returns_{w}'] = np.nan
+        else:
+            features[f'returns_{w}'] = (df['close_usd'].iloc[-1] / df['close_usd'].iloc[-w]) - 1
+            features[f'log_returns_{w}'] = np.log(df['close_usd'].iloc[-1] / df['close_usd'].iloc[-w])
+    
+    # Volatility features
+    for w in [30, 60]:
+        if len(df) < w:
+            features[f'volatility_{w}'] = np.nan
+            features[f'high_low_range_{w}'] = np.nan
+        else:
+            returns = df['close_usd'].iloc[-w:].pct_change().dropna()
+            features[f'volatility_{w}'] = returns.std()
+            
+            if 'high_usd' in df.columns and 'low_usd' in df.columns:
+                high_low = (df['high_usd'].iloc[-w:] - df['low_usd'].iloc[-w:]) / df['close_usd'].iloc[-w:]
+                features[f'high_low_range_{w}'] = high_low.mean()
+            else:
+                features[f'high_low_range_{w}'] = 0
+    
+    # Z-score features
+    for w in [30, 60, 120]:
+        if len(df) < w:
+            features[f'zscore_{w}'] = np.nan
+        else:
+            prices = df['close_usd'].iloc[-w:]
+            mean = prices.mean()
+            std = prices.std()
+            if std == 0:
+                features[f'zscore_{w}'] = 0
+            else:
+                features[f'zscore_{w}'] = (df['close_usd'].iloc[-1] - mean) / std
+    
+    # Time features
+    if 'Datetime' in df.columns and len(df) > 0:
+        dt = df['Datetime'].iloc[-1]
+        if isinstance(dt, str):
+            dt = pd.to_datetime(dt)
+        features['hour_of_day'] = dt.hour
+        features['minute_of_hour'] = dt.minute
+        features['day_of_week'] = dt.dayofweek
+        features['hour_sin'] = np.sin(2 * np.pi * dt.hour / 24)
+        features['hour_cos'] = np.cos(2 * np.pi * dt.hour / 24)
+    else:
+        features['hour_of_day'] = 0
+        features['minute_of_hour'] = 0
+        features['day_of_week'] = 0
+        features['hour_sin'] = 0
+        features['hour_cos'] = 0
+    
+    # Pair characteristics
+    features['is_usd_inverse'] = 1.0 if pair.startswith('USD') else 0.0
+    features['is_major'] = 1.0 if pair in ['EURUSD', 'USDJPY', 'GBPUSD', 'AUDUSD', 'USDCAD', 'USDCHF'] else 0.0
+    features['is_em'] = 1.0 if pair in ['USDMXN', 'USDZAR', 'USDTRY'] else 0.0
+    
+    return features
+
+
+def generate_training_data_multiday(data_dir: Path, pairs: list, start_date: str, end_date: str,
+                                     rebalance_minutes: int = 60, prediction_horizon: int = 60) -> pd.DataFrame:
+    """
+    Generate training data from multiple days of historical data.
+    Matches baseline fx_ltr_momentum_bidask.py exactly.
+    
+    Args:
+        data_dir: Path to data directory (data/bidask/output)
+        pairs: List of currency pairs
+        start_date: Start date YYYYMMDD
+        end_date: End date YYYYMMDD
+        rebalance_minutes: Rebalance frequency
+        prediction_horizon: Minutes ahead to predict
+        
+    Returns:
+        DataFrame with features and labels for each pair at each rebalance
+    """
+    from fx_backtest_base import load_pair_data
+    
+    print(f"Generating training data from {start_date} to {end_date}...")
+    
+    start_dt = datetime.strptime(start_date, '%Y%m%d')
+    end_dt = datetime.strptime(end_date, '%Y%m%d')
+    
+    date_range = pd.date_range(start_dt, end_dt, freq='D')
+    date_range = [d for d in date_range if d.weekday() < 5]  # Mon-Fri only
+    
+    training_rows = []
+    
+    for date in date_range:
+        date_str = date.strftime('%Y%m%d')
+        
+        # Load data for all pairs
+        pair_data = {}
+        for pair in pairs:
+            df = load_pair_data(date_str, pair, str(data_dir))
+            if df is not None and len(df) > 0:
+                pair_data[pair] = df
+        
+        if len(pair_data) < 2:
+            continue
+        
+        # Align timestamps - match baseline exactly
+        all_timestamps = set()
+        for df in pair_data.values():
+            all_timestamps.update(df['Datetime'].values)
+        
+        common_timestamps = pd.DataFrame({'Datetime': sorted(all_timestamps)})
+        
+        aligned_data = {}
+        for pair, df in pair_data.items():
+            merged = common_timestamps.merge(df, on='Datetime', how='left')
+            # Forward fill ONLY price columns (match baseline behavior exactly)
+            fill_cols = ['open', 'high', 'low', 'close']
+            if 'bid' in merged.columns:
+                fill_cols.append('bid')
+            if 'ask' in merged.columns:
+                fill_cols.append('ask')
+            if 'offer' in merged.columns:
+                fill_cols.append('offer')
+            # Also need to fill USD-normalized columns
+            for col in ['open_usd', 'high_usd', 'low_usd', 'close_usd', 'bid_usd', 'ask_usd']:
+                if col in merged.columns:
+                    fill_cols.append(col)
+            merged[fill_cols] = merged[fill_cols].ffill()
+            aligned_data[pair] = merged
+        
+        pair_data = aligned_data
+        
+        # Get common timestamps
+        first_pair = list(pair_data.keys())[0]
+        timestamps = pair_data[first_pair]['Datetime'].values
+        num_bars = len(timestamps)
+        
+        # Generate training samples at each rebalance point
+        for idx in range(120, num_bars - prediction_horizon, rebalance_minutes):
+            timestamp = timestamps[idx]
+            group_id = f"{date_str}_{timestamp}"
+            
+            # For each pair, extract features and calculate label
+            for pair in pair_data.keys():
+                df = pair_data[pair]
+                
+                # Extract features at current timestamp
+                df_history = df.iloc[:idx + 1]
+                features = calculate_features(df_history, pair)
+                
+                if not features:
+                    continue
+                
+                # Calculate label (next-hour PnL)
+                current_price = df.iloc[idx]['close']
+                future_price = df.iloc[idx + prediction_horizon]['close']
+                
+                # PnL calculation with USD direction correction
+                if pair.startswith('USD'):  # USD inverse pairs
+                    # For USD/JPY etc, we short when ranked high (strong JPY)
+                    next_hour_pnl = -(future_price - current_price) / current_price
+                else:  # Regular pairs
+                    # For EUR/USD etc, we long when ranked high (strong EUR)
+                    next_hour_pnl = (future_price - current_price) / current_price
+                
+                # Create training row
+                row = {
+                    'pair': pair,
+                    'timestamp': timestamp,
+                    'group_id': group_id,
+                    'label': next_hour_pnl,
+                }
+                row.update(features)
+                
+                training_rows.append(row)
+    
+    df_train = pd.DataFrame(training_rows)
+    
+    if len(df_train) > 0:
+        print(f"Generated {len(df_train)} training samples across {df_train['group_id'].nunique()} rebalance periods")
+    else:
+        print("WARNING: No training samples generated!")
+    
+    return df_train
+
+
+def generate_training_data(all_data: Dict[str, pd.DataFrame], rebalance_indices: list,
+                          top_n: int = 2) -> pd.DataFrame:
+    """
+    Generate training samples from historical data.
+    
+    For each rebalance, create samples with features + forward returns as target.
+    This creates a learning-to-rank problem where we learn to predict which pairs
+    will have the best forward returns.
+    
+    Args:
+        all_data: Dictionary of pair -> DataFrame
+        rebalance_indices: List of bar indices where rebalances occur
+        top_n: Number of top/bottom pairs to select
+        
+    Returns:
+        DataFrame with features and targets for training
+    """
+    samples = []
+    
+    for idx in rebalance_indices:
+        if idx < 120:  # Need history for features
+            continue
+        
+        # For each pair, calculate features and forward return
+        for pair, df in all_data.items():
+            if idx >= len(df) - 1:  # Need next bar for target
+                continue
+            
+            # Calculate features at this point
+            features = calculate_features(df.iloc[:idx+1], pair)
+            if not features:
+                continue
+            
+            # Calculate forward return (target to rank by)
+            # CRITICAL: For USD-inverse pairs (USDJPY, USDCAD, etc), we need to NEGATE
+            # the return because when USD strengthens vs JPY, close_usd goes UP but we
+            # want to SHORT that pair (not LONG it).
+            current_price = df['close_usd'].iloc[idx]
+            next_price = df['close_usd'].iloc[idx+1]
+            raw_return = (next_price / current_price) - 1
+            
+            # Negate for USD-inverse pairs so model learns correct direction
+            if pair.startswith('USD'):  # USDJPY, USDCAD, etc.
+                forward_return = -raw_return
+            else:  # EURUSD, GBPUSD, etc.
+                forward_return = raw_return
+            
+            sample = features.copy()
+            sample['pair'] = pair
+            sample['timestamp'] = df['Datetime'].iloc[idx] if 'Datetime' in df.columns else idx
+            sample['target'] = forward_return
+            samples.append(sample)
+    
+    return pd.DataFrame(samples)
+
+
+# =============================================================================
+# LTR MODEL
+# =============================================================================
+
+class LTRModel:
+    """LightGBM ranking model for pair selection."""
+    
+    def __init__(self):
+        self.model = None
+        self.feature_columns = None
+    
+    def train(self, train_df: pd.DataFrame):
+        """
+        Train ranking model using LightGBM regression to predict PnL.
+        
+        We use regression (not lambdarank) because:
+        - Our targets are continuous PnL values (not integer relevance scores)
+        - We want to predict which pairs will have best forward returns
+        - Rankings are derived from the predicted values
+        
+        Args:
+            train_df: DataFrame with features, pairs, timestamps, and targets
+        """
+        if len(train_df) == 0:
+            raise ValueError("No training data provided")
+        
+        # Prepare features and target (column is named 'label' in training data)
+        feature_cols = [c for c in train_df.columns if c not in ['pair', 'timestamp', 'group_id', 'label']]
+        X = train_df[feature_cols].values
+        y = train_df['label'].values
+        
+        # Create LightGBM dataset (no grouping needed for regression)
+        train_data = lgb.Dataset(X, label=y, feature_name=feature_cols, free_raw_data=False)
+        
+        # Train LightGBM regressor
+        print("Training LightGBM regression model...")
+        print(f"Attempting GPU training (fallback to CPU with 32 threads)...")
+        
+        try:
+            # Try GPU first
+            params = {
+                'objective': 'regression',
+                'metric': 'l1',
+                'device': 'gpu',
+                'gpu_platform_id': 0,
+                'gpu_device_id': 0,
+                'verbosity': -1,
+                'num_leaves': 31,
+                'learning_rate': 0.05,
+                'feature_fraction': 0.9,
+                'bagging_fraction': 0.8,
+                'bagging_freq': 5,
+                'num_threads': 32,
+            }
+            
+            import time
+            start_time = time.time()
+            self.model = lgb.train(params, train_data, num_boost_round=100)
+            elapsed = time.time() - start_time
+            print(f"✓ Model trained using GPU in {elapsed:.2f}s")
+            
+        except Exception as e:
+            # Fallback to CPU
+            print(f"GPU not available ({e})")
+            print(f"→ Using CPU with 32 threads...")
+            
+            params = {
+                'objective': 'regression',
+                'metric': 'l1',
+                'verbosity': -1,
+                'num_leaves': 31,
+                'learning_rate': 0.05,
+                'feature_fraction': 0.9,
+                'bagging_fraction': 0.8,
+                'bagging_freq': 5,
+                'num_threads': 32,
+            }
+            
+            import time
+            start_time = time.time()
+            self.model = lgb.train(params, train_data, num_boost_round=100)
+            elapsed = time.time() - start_time
+            print(f"✓ Model trained using CPU in {elapsed:.2f}s")
+        
+        self.feature_columns = feature_cols
+        
+        # Show feature importance
+        importance = self.model.feature_importance(importance_type='gain')
+        feature_importance = pd.DataFrame({
+            'feature': feature_cols,
+            'importance': importance
+        }).sort_values('importance', ascending=False)
+        
+        print("\nTop 10 Most Important Features:")
+        print(feature_importance.head(10).to_string(index=False))
+        print()
+    
+    def predict(self, features_df: pd.DataFrame) -> np.ndarray:
+        """Predict ranking scores for pairs."""
+        if self.model is None:
+            raise ValueError("Model not trained yet")
+        
+        X = features_df[self.feature_columns].values
+        return self.model.predict(X)
+    
+    def save(self, filepath: str):
+        """Save model to disk."""
+        if self.model is not None:
+            self.model.save_model(filepath)
+            print(f"Model saved to: {filepath}")
+    
+    def load(self, filepath: str):
+        """Load model from disk."""
+        self.model = lgb.Booster(model_file=filepath)
+        print(f"Model loaded from: {filepath}")
+
+
+# =============================================================================
+# LTR RANKER (Manages model training and prediction)
+# =============================================================================
+
+class LTRRanker:
+    """
+    Manages LTR model training and prediction.
+    Handles periodic retraining on rolling windows of data.
+    """
+    
+    def __init__(self, retrain_frequency: int = 7, training_days: int = 30):
+        """
+        Args:
+            retrain_frequency: Retrain model every N days
+            training_days: Use last N days for training (currently not fully implemented)
+        """
+        self.retrain_frequency = retrain_frequency
+        self.training_days = training_days
+        self.model = LTRModel()
+        self.last_train_date = None
+        self.model_dir = Path("working_files/ltr_models")
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        self.training_data_accumulated = []  # Store training samples
+    
+    def should_retrain(self, current_date) -> bool:
+        """Check if model should be retrained on Saturdays."""
+        # Convert to datetime if string
+        if isinstance(current_date, str):
+            current_date = pd.to_datetime(current_date)
+            
+        if self.last_train_date is None:
+            return True
+        
+        # Retrain on Saturdays only (weekday() returns 5 for Saturday)
+        if current_date.weekday() == 5:  # Saturday
+            days_since_train = (current_date - self.last_train_date).days
+            return days_since_train >= self.retrain_frequency
+        
+        return False
+    
+    def retrain(self, data_dir: Path, pairs: list, current_date, 
+                rebalance_freq: int = 60, prediction_horizon: int = 60):
+        """
+        Retrain model on multi-day historical data.
+        Uses past training_days of data to train model, matching baseline behavior.
+        
+        Args:
+            data_dir: Path to data directory
+            pairs: List of currency pairs
+            current_date: Current date (datetime or string)
+            rebalance_freq: Rebalance frequency in minutes
+            prediction_horizon: Minutes ahead to predict (for training labels)
+        """
+        # Convert to datetime if string
+        if isinstance(current_date, str):
+            current_date = pd.to_datetime(current_date)
+        
+        print("=" * 80)
+        print(f"RETRAINING MODEL on {current_date.strftime('%Y%m%d')} ({current_date.strftime('%A')})")
+        print("=" * 80)
+        
+        # Calculate training window (past N days before current date)
+        end_date = current_date - timedelta(days=1)  # Don't include current date in training
+        start_date = end_date - timedelta(days=self.training_days)
+        
+        start_str = start_date.strftime('%Y%m%d')
+        end_str = end_date.strftime('%Y%m%d')
+        
+        # Generate training data from historical dates
+        train_df = generate_training_data_multiday(
+            data_dir, pairs, start_str, end_str, 
+            rebalance_minutes=rebalance_freq,
+            prediction_horizon=prediction_horizon
+        )
+        
+        if len(train_df) < 100:
+            print(f"Insufficient training data ({len(train_df)} < 100 samples), skipping retrain")
+            return False
+        
+        print(f"Training with {len(train_df)} samples...")
+        print()
+        
+        self.model.train(train_df)
+        self.last_train_date = current_date
+        
+        # Save model
+        model_file = self.model_dir / f"ltr_model_{current_date.strftime('%Y%m%d')}.txt"
+        self.model.save(str(model_file))
+        
+        return True
+    
+    def rank_pairs(self, all_data: Dict[str, pd.DataFrame], idx: int) -> Dict[str, float]:
+        """
+        Rank pairs using LTR model.
+        
+        Args:
+            all_data: Dictionary of pair -> DataFrame
+            idx: Current bar index
+            
+        Returns:
+            Dictionary of pair -> ranking score (higher is better)
+        """
+        if self.model.model is None:
+            # No model trained yet - use random ranking as fallback
+            print("WARNING: No trained model - using random rankings")
+            return {pair: np.random.random() for pair in all_data.keys()}
+        
+        # Calculate features for all pairs
+        features_list = []
+        pairs_list = []
+        
+        for pair, df in all_data.items():
+            features = calculate_features(df.iloc[:idx+1], pair)
+            if features:
+                features_list.append(features)
+                pairs_list.append(pair)
+        
+        if not features_list:
+            return {pair: 0.0 for pair in all_data.keys()}
+        
+        # Predict scores
+        features_df = pd.DataFrame(features_list)
+        scores = self.model.predict(features_df)
+        
+        # Create ranking dictionary
+        rankings = {pair: float(score) for pair, score in zip(pairs_list, scores)}
+        
+        # For missing pairs, assign lowest score
+        for pair in all_data.keys():
+            if pair not in rankings:
+                rankings[pair] = -999.0
+        
+        return rankings
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='FX LTR Momentum Strategy')
+    parser.add_argument('--start-date', type=str, required=True, help='Start date MMDDYYYY')
+    parser.add_argument('--end-date', type=str, required=True, help='End date MMDDYYYY')
+    parser.add_argument('--rebalance-freq', type=int, default=60, help='Rebalance frequency in minutes')
+    parser.add_argument('--top-n', type=int, default=2, help='Number of pairs to go long/short')
+    parser.add_argument('--training-days', type=int, default=30, help='Days of history for training')
+    parser.add_argument('--retrain-frequency', type=int, default=7, help='Retrain model every N days')
+    parser.add_argument('--start-hour', type=int, default=0, help='Start hour for trading (EST)')
+    parser.add_argument('--end-hour', type=int, default=23, help='End hour for trading (EST)')
+    
+    args = parser.parse_args()
+    
+    # Parse dates from MMDDYYYY to YYYYMMDD
+    start_dt = pd.to_datetime(args.start_date, format='%m%d%Y')
+    end_dt = pd.to_datetime(args.end_date, format='%m%d%Y')
+    start_date = start_dt.strftime('%Y%m%d')
+    end_date = end_dt.strftime('%Y%m%d')
+    
+    # Configuration
+    DATA_DIR = Path("data/bidask/output")
+    
+    # Currency pairs
+    pairs = ['AUDUSD', 'EURUSD', 'GBPUSD', 'USDCAD', 'USDCHF', 'USDJPY', 
+             'USDMXN', 'USDNOK', 'USDSEK', 'USDZAR']
+    
+    print(f"Found {len(pairs)} currency pairs: {pairs}\n")
+    
+    print("Running backtest from {} to {}".format(start_date, end_date))
+    print(f"Rebalance: every {args.rebalance_freq} min, Top N: {args.top_n}")
+    print(f"USD Notional per position: $1,000,000")
+    print(f"Trading Hours: {args.start_hour:02d}:00 - {args.end_hour:02d}:00 EST")
+    print(f"Model Retraining: Every {args.retrain_frequency} days")
+    print("=" * 80)
+    print()
+    
+    # Create LTR ranker
+    ltr_ranker = LTRRanker(
+        retrain_frequency=args.retrain_frequency,
+        training_days=args.training_days
+    )
+    
+    # Create backtester
+    backtester = FXBacktester(
+        pairs=pairs,
+        start_date=start_date,
+        end_date=end_date,
+        rebalance_freq=args.rebalance_freq,
+        top_n=args.top_n,
+        usd_notional=1_000_000,
+        start_hour=args.start_hour,
+        end_hour=args.end_hour,
+        data_dir=str(DATA_DIR),
+        lookback_bars=120,  # Use 120-bar lookback for LTR features
+    )
+    
+    # Create ranking function that uses LTR
+    def ranking_func(all_data, idx):
+        """Ranking function that uses LTR model."""
+        # Get current date for potential retraining
+        current_date = list(all_data.values())[0]['Datetime'].iloc[idx]
+        
+        # Check if we need to retrain
+        if ltr_ranker.should_retrain(current_date):
+            # Retrain on multi-day historical data
+            ltr_ranker.retrain(
+                data_dir=DATA_DIR,
+                pairs=pairs,
+                current_date=current_date,
+                rebalance_freq=args.rebalance_freq,
+                prediction_horizon=args.rebalance_freq  # Predict one rebalance period ahead
+            )
+        
+        # Rank pairs using current model
+        return ltr_ranker.rank_pairs(all_data, idx)
+    
+    # Run backtest
+    results_df, trades_df = backtester.run(ranking_func)
+    
+    # Calculate and print statistics
+    stats = calculate_statistics(results_df, trades_df)
+    print("\n" + "=" * 80)
+    print("BACKTEST RESULTS")
+    print("=" * 80)
+    print_statistics(stats)
+    
+    # Save results
+    output_dir = Path("working_files/fx_momentum_results")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Generate filename
+    hours_suffix = f"_h{args.start_hour}-{args.end_hour}" if args.start_hour is not None else ""
+    base_filename = f"ltr_{start_date}_{end_date}_rebal{args.rebalance_freq}_top{args.top_n}_train{args.training_days}_retrain{args.retrain_frequency}{hours_suffix}"
+    
+    results_file = output_dir / f"results_{base_filename}.csv"
+    trades_file = output_dir / f"trades_{base_filename}.csv"
+    
+    results_df.to_csv(results_file, index=False)
+    trades_df.to_csv(trades_file, index=False)
+    
+    print(f"\nResults saved to: {results_file}")
+    print(f"Trades saved to: {trades_file}")
+    
+    # Show sample trades
+    if len(trades_df) > 0:
+        print(f"\nSample trades (first 10):")
+        print(trades_df[['timestamp', 'date', 'pair', 'execution_side', 'entry_price', 
+                         'exit_price', 'pnl_usd', 'pnl_pct', 'rank_score']].head(10).to_string(index=False))
