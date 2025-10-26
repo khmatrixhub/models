@@ -22,81 +22,92 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
 from fx_backtest_base import FXBacktester, calculate_statistics, print_statistics
+from fx_ltr_features import calculate_features  # NEW: Use modular features
+
+
+# =============================================================================
+# G7 PAIRS AND VOLATILITY FILTERING
+# =============================================================================
+
+# Only trade G7 pairs (exclude EM pairs with wide spreads)
+G7_PAIRS = ['AUDUSD', 'EURUSD', 'GBPUSD', 'USDCAD', 'USDCHF', 'USDJPY']
+
+# Volatility thresholds - only trade when prev bar volatility > threshold
+VOL_THRESHOLDS_BPS = {
+    'EURUSD': 3.0,
+    'USDJPY': 3.5,
+    'AUDUSD': 3.5,
+    'GBPUSD': 3.0,
+    'USDCAD': 3.0,
+    'USDCHF': 2.5,
+}
 
 
 # =============================================================================
 # FEATURE ENGINEERING
 # =============================================================================
 
-def calculate_features(df: pd.DataFrame, pair: str) -> Dict[str, float]:
+# Features are now imported from fx_ltr_features module with additional filtering features
+# This gives us 37 base features across 7 modular blocks PLUS filtering features:
+# - block_spread_micro (2 features): spread_bps, close_minus_mid_bps
+# - block_intraday_mom (9 features): ret_5m/15m/30m/60m, zret_*, slope_10
+# - block_breakout_rolling (3 features): donch_30m/60m, clv_1
+# - block_garman_klass_vol (2 features): gk_vol_60m, rv_60m
+# - block_rebalance_clock (5 features): bar_in_hour, mins_to_rebalance, hour_sin/cos, dow
+# - block_pair_characteristics (3 features): is_usd_inverse, is_major, is_em
+# - block_legacy_features (13 features): returns_*, volatility_*, zscore_* (backwards compatible)
+# 
+# FILTERING FEATURES (added to modular features):
+# - prev_bar_volatility: Previous bar's HL range in bps (for filtering)
+# - vol_spread_ratio: Volatility / spread ratio
+# - is_tradeable: Binary flag if vol > threshold
+
+
+def add_filtering_features(features: Dict[str, float], df: pd.DataFrame, pair: str) -> Dict[str, float]:
     """
-    Calculate features for a single pair at current point in time.
-    Uses USD-normalized prices for consistent cross-sectional comparison.
-    MATCHES baseline fx_ltr_momentum_bidask.py exactly.
-    """
-    features = {}
+    Add volatility filtering features to the base modular features.
     
-    if len(df) < 120:
+    Args:
+        features: Base features from fx_ltr_features module
+        df: Historical data DataFrame
+        pair: Currency pair name
+        
+    Returns:
+        Features dict with added filtering features
+    """
+    # Previous bar volatility (for filtering decision)
+    if len(df) >= 2:
+        prev_hl = df['high'].iloc[-2] - df['low'].iloc[-2]
+        prev_close = df['close'].iloc[-2]
+        features['prev_bar_volatility'] = (prev_hl / prev_close) * 10000 if prev_close > 0 else 0
+    else:
+        features['prev_bar_volatility'] = 0
+    
+    # Vol/Spread ratio (already have spread_bps from modular features)
+    if features.get('spread_bps', 0) > 0:
+        features['vol_spread_ratio'] = features['prev_bar_volatility'] / features['spread_bps']
+    else:
+        features['vol_spread_ratio'] = 0
+    
+    # Is tradeable flag (meets volatility threshold)
+    vol_threshold = VOL_THRESHOLDS_BPS.get(pair, 2.5)
+    features['is_tradeable'] = 1.0 if features['prev_bar_volatility'] > vol_threshold else 0.0
+    
+    return features
+
+
+def calculate_features_with_filter(df: pd.DataFrame, pair: str) -> Dict[str, float]:
+    """
+    Wrapper that combines modular features with filtering features.
+    """
+    # Get base modular features
+    features = calculate_features(df, pair)
+    
+    if not features:
         return features
     
-    # Momentum features (returns and log_returns)
-    for w in [30, 60, 120]:
-        if len(df) < w:
-            features[f'returns_{w}'] = np.nan
-            features[f'log_returns_{w}'] = np.nan
-        else:
-            features[f'returns_{w}'] = (df['close_usd'].iloc[-1] / df['close_usd'].iloc[-w]) - 1
-            features[f'log_returns_{w}'] = np.log(df['close_usd'].iloc[-1] / df['close_usd'].iloc[-w])
-    
-    # Volatility features
-    for w in [30, 60]:
-        if len(df) < w:
-            features[f'volatility_{w}'] = np.nan
-            features[f'high_low_range_{w}'] = np.nan
-        else:
-            returns = df['close_usd'].iloc[-w:].pct_change().dropna()
-            features[f'volatility_{w}'] = returns.std()
-            
-            if 'high_usd' in df.columns and 'low_usd' in df.columns:
-                high_low = (df['high_usd'].iloc[-w:] - df['low_usd'].iloc[-w:]) / df['close_usd'].iloc[-w:]
-                features[f'high_low_range_{w}'] = high_low.mean()
-            else:
-                features[f'high_low_range_{w}'] = 0
-    
-    # Z-score features
-    for w in [30, 60, 120]:
-        if len(df) < w:
-            features[f'zscore_{w}'] = np.nan
-        else:
-            prices = df['close_usd'].iloc[-w:]
-            mean = prices.mean()
-            std = prices.std()
-            if std == 0:
-                features[f'zscore_{w}'] = 0
-            else:
-                features[f'zscore_{w}'] = (df['close_usd'].iloc[-1] - mean) / std
-    
-    # Time features
-    if 'Datetime' in df.columns and len(df) > 0:
-        dt = df['Datetime'].iloc[-1]
-        if isinstance(dt, str):
-            dt = pd.to_datetime(dt)
-        features['hour_of_day'] = dt.hour
-        features['minute_of_hour'] = dt.minute
-        features['day_of_week'] = dt.dayofweek
-        features['hour_sin'] = np.sin(2 * np.pi * dt.hour / 24)
-        features['hour_cos'] = np.cos(2 * np.pi * dt.hour / 24)
-    else:
-        features['hour_of_day'] = 0
-        features['minute_of_hour'] = 0
-        features['day_of_week'] = 0
-        features['hour_sin'] = 0
-        features['hour_cos'] = 0
-    
-    # Pair characteristics
-    features['is_usd_inverse'] = 1.0 if pair.startswith('USD') else 0.0
-    features['is_major'] = 1.0 if pair in ['EURUSD', 'USDJPY', 'GBPUSD', 'AUDUSD', 'USDCAD', 'USDCHF'] else 0.0
-    features['is_em'] = 1.0 if pair in ['USDMXN', 'USDZAR', 'USDTRY'] else 0.0
+    # Add filtering features
+    features = add_filtering_features(features, df, pair)
     
     return features
 
@@ -186,10 +197,14 @@ def generate_training_data_multiday(data_dir: Path, pairs: list, start_date: str
                 
                 # Extract features at current timestamp
                 df_history = df.iloc[:idx + 1]
-                features = calculate_features(df_history, pair)
+                features = calculate_features_with_filter(df_history, pair)
                 
                 if not features:
                     continue
+                
+                # CRITICAL: Skip if below volatility threshold (filtering)
+                if features.get('is_tradeable', 0) == 0:
+                    continue  # Skip low-volatility scenarios
                 
                 # Calculate label (next-hour PnL)
                 current_price = df.iloc[idx]['close']
@@ -253,8 +268,12 @@ def generate_training_data(all_data: Dict[str, pd.DataFrame], rebalance_indices:
                 continue
             
             # Calculate features at this point
-            features = calculate_features(df.iloc[:idx+1], pair)
+            features = calculate_features_with_filter(df.iloc[:idx+1], pair)
             if not features:
+                continue
+            
+            # CRITICAL: Skip if below volatility threshold
+            if features.get('is_tradeable', 0) == 0:
                 continue
             
             # Calculate forward return (target to rank by)
@@ -385,6 +404,16 @@ class LTRModel:
         X = features_df[self.feature_columns].values
         return self.model.predict(X)
     
+    def get_feature_importance(self) -> list:
+        """Get feature importance as sorted list of (feature, importance) tuples."""
+        if self.model is None:
+            return []
+        
+        importance = self.model.feature_importance(importance_type='gain')
+        feature_importance = [(self.feature_columns[i], importance[i]) 
+                             for i in range(len(self.feature_columns))]
+        return sorted(feature_importance, key=lambda x: x[1], reverse=True)
+    
     def save(self, filepath: str):
         """Save model to disk."""
         if self.model is not None:
@@ -482,6 +511,14 @@ class LTRRanker:
         self.model.train(train_df)
         self.last_train_date = current_date
         
+        # Print feature importance
+        print("\nTop 20 Feature Importances:")
+        print("-" * 60)
+        feature_importance = self.model.get_feature_importance()
+        for i, (feat, imp) in enumerate(feature_importance[:20], 1):
+            print(f"{i:2}. {feat:30} {imp:>10.1f}")
+        print()
+        
         # Save model
         model_file = self.model_dir / f"ltr_model_{current_date.strftime('%Y%m%d')}.txt"
         self.model.save(str(model_file))
@@ -509,10 +546,12 @@ class LTRRanker:
         pairs_list = []
         
         for pair, df in all_data.items():
-            features = calculate_features(df.iloc[:idx+1], pair)
+            features = calculate_features_with_filter(df.iloc[:idx+1], pair)
             if features:
-                features_list.append(features)
-                pairs_list.append(pair)
+                # CRITICAL: Only include pairs that pass volatility filter
+                if features.get('is_tradeable', 0) == 1:
+                    features_list.append(features)
+                    pairs_list.append(pair)
         
         if not features_list:
             return {pair: 0.0 for pair in all_data.keys()}
@@ -558,17 +597,18 @@ if __name__ == "__main__":
     # Configuration
     DATA_DIR = Path("data/bidask/output")
     
-    # Currency pairs
-    pairs = ['AUDUSD', 'EURUSD', 'GBPUSD', 'USDCAD', 'USDCHF', 'USDJPY', 
-             'USDMXN', 'USDNOK', 'USDSEK', 'USDZAR']
+    # Currency pairs - G7 ONLY (filtered for tight spreads)
+    pairs = G7_PAIRS
     
-    print(f"Found {len(pairs)} currency pairs: {pairs}\n")
+    print(f"Found {len(pairs)} G7 currency pairs: {pairs}\n")
     
     print("Running backtest from {} to {}".format(start_date, end_date))
     print(f"Rebalance: every {args.rebalance_freq} min, Top N: {args.top_n}")
     print(f"USD Notional per position: $1,000,000")
     print(f"Trading Hours: {args.start_hour:02d}:00 - {args.end_hour:02d}:00 EST")
     print(f"Model Retraining: Every {args.retrain_frequency} days")
+    print(f"NEW Features: 40 features (37 modular + 3 filtering)")
+    print(f"Volatility Filtering: Enabled (G7 pairs only)")
     print("=" * 80)
     print()
     

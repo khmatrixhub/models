@@ -166,6 +166,18 @@ def load_pair_data(date_str: str, pair: str, data_dir: str = "data/bidask/output
     # Add bid/ask spreads (will use existing data if available)
     df = add_bid_ask_to_data(df, pair)
     
+    # Forward fill 0 and NaN values in price columns to prevent divide-by-zero errors
+    price_cols = ['close', 'close_bid', 'close_ask', 'open', 'open_bid', 'open_ask',
+                  'high', 'high_bid', 'high_ask', 'low', 'low_bid', 'low_ask']
+    
+    for col in price_cols:
+        if col in df.columns:
+            # Replace 0 with NaN, then forward fill
+            df[col] = df[col].replace(0, np.nan)
+            df[col] = df[col].ffill()
+            # If still NaN at start, backfill
+            df[col] = df[col].bfill()
+    
     # Transform to USD terms for momentum calculation
     df = transform_to_usd_terms(df, pair)
     
@@ -186,18 +198,28 @@ def load_all_pairs(date_str: str, pairs: List[str], data_dir: str = "data/bidask
 # POSITION MANAGEMENT
 # =============================================================================
 
-def calculate_pnl(position_info: Dict, current_price_bid: float, current_price_ask: float, pair: str) -> Dict:
+def calculate_pnl(position_info: Dict, current_price_bid: float, current_price_ask: float, 
+                  current_price_close: float, pair: str) -> Dict:
     """
     Calculate PnL for a position using bid/ask prices.
+    Also calculates gross PnL using mid/close prices.
     
     Position entry uses bid (sell) or ask (buy) prices.
     Position exit uses opposite: ask (sell to close long) or bid (buy to close short).
+    
+    PnL Formula (works for ALL pairs):
+        PnL_USD = direction * base_notional * price_change_pct
+    
+    Where:
+        - base_notional is always in the BASE currency of the pair
+        - USD/JPY: base_notional = $1M USD, price_change_pct = % change in JPY/USD rate
+        - EUR/USD: base_notional = ~952K EUR, price_change_pct = % change in USD/EUR rate
+        - Both formulas give PnL in USD
     """
     entry_price = position_info['entry_price']
+    entry_close = position_info.get('entry_close', entry_price)  # Fallback for old positions
     direction = position_info['direction']
-    usd_notional = position_info['usd_notional']
-    pair_notional = position_info['pair_notional']
-    is_inverse = is_usd_inverse(pair)
+    base_notional = position_info['base_notional']
     
     # Determine exit price based on position direction
     if direction > 0:  # LONG position
@@ -207,26 +229,31 @@ def calculate_pnl(position_info: Dict, current_price_bid: float, current_price_a
         # To close: BUY at ASK
         exit_price = current_price_ask
     
-    # Calculate price change
+    # Exit close is just the mid price
+    exit_close = current_price_close
+    
+    # Calculate price change (net, with spreads)
     price_change = exit_price - entry_price
     price_change_pct = price_change / entry_price
     
-    # Calculate PnL in USD
-    if is_inverse:
-        # Inverse pair (USD/JPY): USD is base currency
-        # PnL = pair_notional * price_change_pct
-        # = pair_notional * (exit - entry) / entry
-        pnl_usd = direction * pair_notional * price_change_pct
-    else:
-        # Regular pair (EUR/USD): USD is quote currency
-        # PnL = direction * price_change * pair_notional
-        pnl_usd = direction * price_change * pair_notional
+    # Calculate price change (gross, mid-to-mid)
+    price_change_gross = exit_close - entry_close
+    price_change_pct_gross = price_change_gross / entry_close
+    
+    # Calculate PnL in USD using unified formula
+    # For ALL pairs: PnL = direction * base_notional * price_change_pct
+    pnl_usd = direction * base_notional * price_change_pct
+    pnl_usd_gross = direction * base_notional * price_change_pct_gross
     
     return {
         'pnl_usd': pnl_usd,
+        'pnl_usd_gross': pnl_usd_gross,
         'exit_price': exit_price,
+        'exit_close': exit_close,
         'price_change': price_change,
         'price_change_pct': price_change_pct,
+        'price_change_gross': price_change_gross,
+        'price_change_pct_gross': price_change_pct_gross,
     }
 
 
@@ -430,8 +457,10 @@ class FXBacktester:
             if new_direction != pos_info['direction']:
                 current_price_bid = all_data[pair]['close_bid'].iloc[idx]
                 current_price_ask = all_data[pair]['close_ask'].iloc[idx]
+                current_price_close = all_data[pair]['close'].iloc[idx]
                 
-                pnl_info = calculate_pnl(pos_info, current_price_bid, current_price_ask, pair)
+                pnl_info = calculate_pnl(pos_info, current_price_bid, current_price_ask, 
+                                        current_price_close, pair)
                 total_pnl_usd += pnl_info['pnl_usd']
                 
                 # Record trade
@@ -495,6 +524,9 @@ class FXBacktester:
         """Open a new position."""
         direction = position['direction']
         
+        # Get mid/close price for gross PnL calculation
+        entry_close = data['close'].iloc[idx]
+        
         # Determine entry price based on direction
         if direction > 0:  # LONG
             entry_price = data['close_ask'].iloc[idx]  # BUY at ASK
@@ -504,18 +536,28 @@ class FXBacktester:
         # Calculate position size
         is_inverse = is_usd_inverse(pair)
         if is_inverse:
-            # USD/JPY: USD is base, so pair_notional = usd_notional
-            pair_notional = self.usd_notional
+            # USD/JPY @ 157: USD is BASE currency
+            # $1M USD (base) = 157M JPY (quote)
+            base_notional = self.usd_notional  # $1M USD
+            quote_notional = self.usd_notional * entry_price  # 157M JPY
         else:
-            # EUR/USD: USD is quote, so pair_notional = usd_notional / price
-            pair_notional = self.usd_notional / entry_price
+            # EUR/USD @ 1.05: USD is QUOTE currency
+            # 952K EUR (base) = $1M USD (quote)
+            base_notional = self.usd_notional / entry_price  # 952K EUR
+            quote_notional = self.usd_notional  # $1M USD
+        
+        # For backwards compatibility: pair_notional = base_notional (amount in base currency)
+        pair_notional = base_notional
         
         self.current_positions[pair] = {
             'direction': direction,
             'entry_price': entry_price,
+            'entry_close': entry_close,  # Store mid price for gross PnL
             'entry_idx': idx,
             'usd_notional': self.usd_notional,
-            'pair_notional': pair_notional,
+            'pair_notional': pair_notional,  # Kept for backwards compatibility
+            'base_notional': base_notional,
+            'quote_notional': quote_notional,
             'rank_score': rank_score,
         }
     
@@ -546,13 +588,21 @@ class FXBacktester:
             'execution_side': execution_side,
             'currency_position': currency_position,
             'entry_price': pos_info['entry_price'],
+            'entry_close': pos_info.get('entry_close', pos_info['entry_price']),
             'exit_price': pnl_info['exit_price'],
+            'exit_close': pnl_info['exit_close'],
             'price_change': pnl_info['price_change'],
             'price_change_pct': pnl_info['price_change_pct'],
+            'price_change_gross': pnl_info['price_change_gross'],
+            'price_change_pct_gross': pnl_info['price_change_pct_gross'],
             'usd_notional': pos_info['usd_notional'],
             'pair_notional': pos_info['pair_notional'],
+            'base_notional': pos_info['base_notional'],
+            'quote_notional': pos_info['quote_notional'],
             'pnl_usd': pnl_info['pnl_usd'],
+            'pnl_usd_gross': pnl_info['pnl_usd_gross'],
             'pnl_pct': pnl_info['pnl_usd'] / pos_info['usd_notional'],
+            'pnl_pct_gross': pnl_info['pnl_usd_gross'] / pos_info['usd_notional'],
             'rank_score': pos_info.get('rank_score', np.nan),
         }
         
